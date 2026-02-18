@@ -26,7 +26,7 @@ MASS = {
     "B": 59.0,
     "H": 1.0,
 }
-LABEL = {"C1": "C", "C2": "Cl", "A": "A", "B": "B", "H": "H"}
+LABEL = {"C1": "C", "C2": "Cl", "A": "O", "B": "N", "H": "H"}
 CHARGE = {"C1": +0.25, "C2": -0.25, "A": -0.5, "B": 0.0, "H": +0.5}
 
 # Solvent LJ parameters
@@ -39,7 +39,6 @@ LJ_PARAMS: Dict[Tuple[str, str], Tuple[float, float]] = {
     ("A", "C2"): (3.5, 0.3974),
     ("B", "C1"): (3.5, 0.3974),
     ("B", "C2"): (3.5, 0.3974),
-    ("A", "B"): (3.5, 0.3974),
 }
 
 AHB_PARAMS = {
@@ -149,7 +148,7 @@ def get_lj_params(site_type_i: str, site_type_j: str) -> Optional[Tuple[float, f
 
 def coulomb_allowed(site_type_i: str, site_type_j: str) -> bool:
     pair = {site_type_i, site_type_j}
-    if pair == {"A", "H"} or pair == {"B", "H"}:
+    if pair == {"A", "H"} or pair == {"B", "H"} or pair == {"A", "B"}:
         return False
     if pair == {"H"}:
         return False
