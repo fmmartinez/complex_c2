@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and run NVE MD for coarse-grained chloromethane solvent clusters."""
+"""Generate and run NVE MD for coarse-grained chloromethane + AHB complex in vacuum."""
 
 from __future__ import annotations
 
@@ -8,12 +8,10 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 import random
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 AMU_TO_KG = 1.66053906660e-27
 KB = 1.380649e-23
-AVOGADRO = 6.02214076e23
-J_TO_KCAL = 1.0 / 4184.0
 COULOMB_KCAL_MOL_ANG_E2 = 332.063713299
 
 # Conversion factors for internal units (angstrom, fs, amu, kcal/mol)
@@ -21,11 +19,39 @@ M_S_TO_ANG_FS = 1e-5
 AMU_ANG2_FS2_TO_KCAL_MOL = 2390.05736055072
 KCAL_MOL_ANG_TO_AMU_ANG_FS2 = 1.0 / AMU_ANG2_FS2_TO_KCAL_MOL
 
-SIGMA = {"C1": 3.774, "C2": 3.481}
-EPSILON = {"C1": 0.238, "C2": 0.415}
-CHARGE = {"C1": +0.25, "C2": -0.25}
-MASS = {"C1": 15.0, "C2": 35.5}
-LABEL = {"C1": "C", "C2": "Cl"}
+MASS = {
+    "C1": 15.0,
+    "C2": 35.5,
+    "A": 93.0,
+    "B": 59.0,
+    "H": 1.0,
+}
+LABEL = {"C1": "C", "C2": "Cl", "A": "A", "B": "B", "H": "H"}
+CHARGE = {"C1": +0.25, "C2": -0.25, "A": -0.5, "B": 0.0, "H": +0.5}
+
+# Solvent LJ parameters
+SIGMA_SOLVENT = {"C1": 3.774, "C2": 3.481}
+EPSILON_SOLVENT = {"C1": 0.238, "C2": 0.415}
+
+# Explicit LJ pairs for complex interactions (kcal/mol, angstrom)
+LJ_PARAMS: Dict[Tuple[str, str], Tuple[float, float]] = {
+    ("A", "C1"): (3.5, 0.3974),
+    ("A", "C2"): (3.5, 0.3974),
+    ("B", "C1"): (3.5, 0.3974),
+    ("B", "C2"): (3.5, 0.3974),
+    ("A", "B"): (3.5, 0.3974),
+}
+
+AHB_PARAMS = {
+    "a": 11.2,
+    "b": 7.1e13,
+    "c": 0.776,
+    "d_A": 0.95,
+    "d_B": 0.97,
+    "D_A": 110.0,
+    "n_A": 9.26,
+    "n_B": 11.42,
+}
 
 
 @dataclass
@@ -112,7 +138,67 @@ def instantaneous_temperature(sites: List[Site], remove_momentum_dof: bool = Tru
     return (2.0 * kinetic_energy_joule) / (dof * KB)
 
 
-def compute_forces_and_potential(sites: List[Site]) -> Tuple[List[List[float]], float]:
+def get_lj_params(site_type_i: str, site_type_j: str) -> Optional[Tuple[float, float]]:
+    a, b = sorted((site_type_i, site_type_j))
+    if a in {"C1", "C2"} and b in {"C1", "C2"}:
+        sigma_ij = 0.5 * (SIGMA_SOLVENT[a] + SIGMA_SOLVENT[b])
+        epsilon_ij = math.sqrt(EPSILON_SOLVENT[a] * EPSILON_SOLVENT[b])
+        return sigma_ij, epsilon_ij
+    return LJ_PARAMS.get((a, b))
+
+
+def coulomb_allowed(site_type_i: str, site_type_j: str) -> bool:
+    pair = {site_type_i, site_type_j}
+    if pair == {"A", "H"} or pair == {"B", "H"}:
+        return False
+    if pair == {"H"}:
+        return False
+    return True
+
+
+def compute_ahb_potential_and_derivatives(r_ah: float, r_ab: float) -> Tuple[float, float, float]:
+    eps = 1e-12
+    r = max(r_ah, eps)
+    rab = max(r_ab, eps)
+    s = max(rab - r, eps)
+
+    a = AHB_PARAMS["a"]
+    b = AHB_PARAMS["b"]
+    c = AHB_PARAMS["c"]
+    d_a = AHB_PARAMS["d_A"]
+    d_b = AHB_PARAMS["d_B"]
+    dcap = AHB_PARAMS["D_A"]
+    n_a = AHB_PARAMS["n_A"]
+    n_b = AHB_PARAMS["n_B"]
+
+    term1 = b * math.exp(-a * rab)
+
+    x = -n_a * ((r - d_a) ** 2) / (2.0 * r)
+    term2 = dcap * (1.0 - math.exp(x))
+
+    y = -n_b * ((s - d_b) ** 2) / (2.0 * s)
+    term3 = c * dcap * (1.0 - math.exp(y))
+
+    potential = term1 + term2 + term3
+
+    dterm1_drab = -a * b * math.exp(-a * rab)
+
+    dx_dr = -n_a * (r * r - d_a * d_a) / (2.0 * r * r)
+    dterm2_dr = -dcap * math.exp(x) * dx_dr
+
+    dy_ds = -n_b * (s * s - d_b * d_b) / (2.0 * s * s)
+    dterm3_ds = -c * dcap * math.exp(y) * dy_ds
+
+    dterm3_drab = dterm3_ds
+    dterm3_dr = -dterm3_ds
+
+    dV_drab = dterm1_drab + dterm3_drab
+    dV_dr = dterm2_dr + dterm3_dr
+
+    return potential, dV_dr, dV_drab
+
+
+def compute_forces_and_potential(sites: List[Site], n_solvent_molecules: int) -> Tuple[List[List[float]], float]:
     forces = [[0.0, 0.0, 0.0] for _ in sites]
     potential = 0.0
 
@@ -121,7 +207,8 @@ def compute_forces_and_potential(sites: List[Site]) -> Tuple[List[List[float]], 
         xi, yi, zi = si.position_angstrom
         for j in range(i + 1, len(sites)):
             sj = sites[j]
-            if si.molecule_id == sj.molecule_id:
+            if si.molecule_id == sj.molecule_id and si.molecule_id < n_solvent_molecules:
+                # No intramolecular interactions for solvent C1-C2 pair.
                 continue
 
             dx = xi - sj.position_angstrom[0]
@@ -129,45 +216,89 @@ def compute_forces_and_potential(sites: List[Site]) -> Tuple[List[List[float]], 
             dz = zi - sj.position_angstrom[2]
             r2 = dx * dx + dy * dy + dz * dz
             r = math.sqrt(r2)
-
-            sigma_ij = 0.5 * (SIGMA[si.site_type] + SIGMA[sj.site_type])
-            epsilon_ij = math.sqrt(EPSILON[si.site_type] * EPSILON[sj.site_type])
-            qi = CHARGE[si.site_type]
-            qj = CHARGE[sj.site_type]
-
             inv_r = 1.0 / r
-            sr = sigma_ij * inv_r
-            sr2 = sr * sr
-            sr6 = sr2 * sr2 * sr2
-            sr12 = sr6 * sr6
 
-            lj = 4.0 * epsilon_ij * (sr12 - sr6)
-            coul = COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r
-            potential += lj + coul
+            pair_energy = 0.0
+            dUdr = 0.0
 
-            dUdr_lj = 4.0 * epsilon_ij * (-12.0 * sr12 * inv_r + 6.0 * sr6 * inv_r)
-            dUdr_coul = -COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r * inv_r
-            dUdr = dUdr_lj + dUdr_coul
+            lj_params = get_lj_params(si.site_type, sj.site_type)
+            if lj_params is not None:
+                sigma_ij, epsilon_ij = lj_params
+                sr = sigma_ij * inv_r
+                sr2 = sr * sr
+                sr6 = sr2 * sr2 * sr2
+                sr12 = sr6 * sr6
 
-            # Force on i: F_i = -dU/dr * r_hat, r_hat = (r_i-r_j)/r
-            scale = -dUdr * inv_r
-            fx = scale * dx
-            fy = scale * dy
-            fz = scale * dz
+                lj = 4.0 * epsilon_ij * (sr12 - sr6)
+                pair_energy += lj
+                dUdr += 4.0 * epsilon_ij * (-12.0 * sr12 * inv_r + 6.0 * sr6 * inv_r)
 
-            forces[i][0] += fx
-            forces[i][1] += fy
-            forces[i][2] += fz
-            forces[j][0] -= fx
-            forces[j][1] -= fy
-            forces[j][2] -= fz
+            if coulomb_allowed(si.site_type, sj.site_type):
+                qi = CHARGE[si.site_type]
+                qj = CHARGE[sj.site_type]
+                if abs(qi * qj) > 0.0:
+                    coul = COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r
+                    pair_energy += coul
+                    dUdr += -COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r * inv_r
+
+            if pair_energy != 0.0:
+                potential += pair_energy
+                scale = -dUdr * inv_r
+                fx = scale * dx
+                fy = scale * dy
+                fz = scale * dz
+                forces[i][0] += fx
+                forces[i][1] += fy
+                forces[i][2] += fz
+                forces[j][0] -= fx
+                forces[j][1] -= fy
+                forces[j][2] -= fz
+
+    # Special AHB potential
+    idx_a = idx_h = idx_b = None
+    for idx, site in enumerate(sites):
+        if site.site_type == "A":
+            idx_a = idx
+        elif site.site_type == "H":
+            idx_h = idx
+        elif site.site_type == "B":
+            idx_b = idx
+
+    if idx_a is not None and idx_h is not None and idx_b is not None:
+        ra = sites[idx_a].position_angstrom
+        rh = sites[idx_h].position_angstrom
+        rb = sites[idx_b].position_angstrom
+
+        v_ah = [rh[0] - ra[0], rh[1] - ra[1], rh[2] - ra[2]]
+        v_ab = [rb[0] - ra[0], rb[1] - ra[1], rb[2] - ra[2]]
+        r_ah = norm(v_ah)
+        r_ab = norm(v_ab)
+
+        v_ah_u = [v / max(r_ah, 1e-12) for v in v_ah]
+        v_ab_u = [v / max(r_ab, 1e-12) for v in v_ab]
+
+        v_ahb, dV_dr, dV_dR = compute_ahb_potential_and_derivatives(r_ah, r_ab)
+        potential += v_ahb
+
+        # r term (H-A)
+        # F_H = -dV/dr * (r_h-r_a) / r
+        for k in range(3):
+            f_h = -dV_dr * v_ah_u[k]
+            forces[idx_h][k] += f_h
+            forces[idx_a][k] -= f_h
+
+        # R term (A-B)
+        # F_B = -dV/dR * (r_b-r_a) / R
+        for k in range(3):
+            f_b = -dV_dR * v_ab_u[k]
+            forces[idx_b][k] += f_b
+            forces[idx_a][k] -= f_b
 
     return forces, potential
 
 
-def enforce_bond_constraints(sites: List[Site], bond_distance: float) -> None:
-    n_mol = len(sites) // 2
-    for m in range(n_mol):
+def enforce_solvent_bond_constraints(sites: List[Site], n_solvent_molecules: int, bond_distance: float) -> None:
+    for m in range(n_solvent_molecules):
         i = 2 * m
         j = i + 1
         si = sites[i]
@@ -181,8 +312,8 @@ def enforce_bond_constraints(sites: List[Site], bond_distance: float) -> None:
         r = norm(rij)
         if r < 1e-12:
             continue
-        unit = [rij[0] / r, rij[1] / r, rij[2] / r]
 
+        unit = [rij[0] / r, rij[1] / r, rij[2] / r]
         delta = r - bond_distance
         mi = si.mass_amu
         mj = sj.mass_amu
@@ -196,9 +327,8 @@ def enforce_bond_constraints(sites: List[Site], bond_distance: float) -> None:
             sj.position_angstrom[k] += corr_j * unit[k]
 
 
-def enforce_velocity_constraints(sites: List[Site]) -> None:
-    n_mol = len(sites) // 2
-    for m in range(n_mol):
+def enforce_solvent_velocity_constraints(sites: List[Site], n_solvent_molecules: int) -> None:
+    for m in range(n_solvent_molecules):
         i = 2 * m
         j = i + 1
         si = sites[i]
@@ -228,6 +358,78 @@ def enforce_velocity_constraints(sites: List[Site]) -> None:
         for k in range(3):
             si.velocity_ang_fs[k] += (mj / mt) * radial_rel * unit[k]
             sj.velocity_ang_fs[k] -= (mi / mt) * radial_rel * unit[k]
+
+
+def add_ahb_complex(
+    sites: List[Site],
+    n_solvent_molecules: int,
+    temperature_k: float,
+    radius_angstrom: float,
+    min_inter_site_distance_angstrom: float,
+    seed_rng: random.Random,
+) -> None:
+    complex_mol_id = n_solvent_molecules
+
+    for _attempt in range(50000):
+        a_pos = random_point_in_sphere(seed_rng, radius_angstrom)
+        axis = random_unit_vector(seed_rng)
+        h_pos = (
+            a_pos[0] + 1.0 * axis[0],
+            a_pos[1] + 1.0 * axis[1],
+            a_pos[2] + 1.0 * axis[2],
+        )
+        b_pos = (
+            a_pos[0] + 2.7 * axis[0],
+            a_pos[1] + 2.7 * axis[1],
+            a_pos[2] + 2.7 * axis[2],
+        )
+
+        if (
+            norm([a_pos[0], a_pos[1], a_pos[2]]) > radius_angstrom
+            or norm([h_pos[0], h_pos[1], h_pos[2]]) > radius_angstrom
+            or norm([b_pos[0], b_pos[1], b_pos[2]]) > radius_angstrom
+        ):
+            continue
+
+        if all(
+            dist(a_pos, existing.position_angstrom) >= min_inter_site_distance_angstrom
+            and dist(h_pos, existing.position_angstrom) >= min_inter_site_distance_angstrom
+            and dist(b_pos, existing.position_angstrom) >= min_inter_site_distance_angstrom
+            for existing in sites
+        ):
+            sites.append(
+                Site(
+                    molecule_id=complex_mol_id,
+                    site_type="A",
+                    label=LABEL["A"],
+                    mass_amu=MASS["A"],
+                    position_angstrom=[a_pos[0], a_pos[1], a_pos[2]],
+                    velocity_ang_fs=sample_velocity(seed_rng, temperature_k, MASS["A"]),
+                )
+            )
+            sites.append(
+                Site(
+                    molecule_id=complex_mol_id,
+                    site_type="H",
+                    label=LABEL["H"],
+                    mass_amu=MASS["H"],
+                    position_angstrom=[h_pos[0], h_pos[1], h_pos[2]],
+                    velocity_ang_fs=sample_velocity(seed_rng, temperature_k, MASS["H"]),
+                )
+            )
+            sites.append(
+                Site(
+                    molecule_id=complex_mol_id,
+                    site_type="B",
+                    label=LABEL["B"],
+                    mass_amu=MASS["B"],
+                    position_angstrom=[b_pos[0], b_pos[1], b_pos[2]],
+                    velocity_ang_fs=sample_velocity(seed_rng, temperature_k, MASS["B"]),
+                )
+            )
+            return
+
+    raise RuntimeError("Could not place A-H-B complex inside placement radius without overlaps.")
 
 
 def generate_configuration(
@@ -289,12 +491,21 @@ def generate_configuration(
 
         if not placed:
             raise RuntimeError(
-                f"Could not place molecule {mol_idx + 1} without overlaps after many attempts."
+                f"Could not place solvent molecule {mol_idx + 1} without overlaps after many attempts."
             )
 
+    add_ahb_complex(
+        sites=sites,
+        n_solvent_molecules=n_molecules,
+        temperature_k=temperature_k,
+        radius_angstrom=radius_angstrom,
+        min_inter_site_distance_angstrom=min_inter_site_distance_angstrom,
+        seed_rng=rng,
+    )
+
     remove_net_linear_momentum(sites)
-    enforce_bond_constraints(sites, c1_c2_distance_angstrom)
-    enforce_velocity_constraints(sites)
+    enforce_solvent_bond_constraints(sites, n_molecules, c1_c2_distance_angstrom)
+    enforce_solvent_velocity_constraints(sites, n_molecules)
     return sites
 
 
@@ -307,19 +518,28 @@ def append_xyz_frame(path: Path, sites: List[Site], comment: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+def write_initial_xyz(path: Path, sites: List[Site], comment: str) -> None:
+    lines = [str(len(sites)), comment]
+    for site in sites:
+        x, y, z = site.position_angstrom
+        lines.append(f"{site.label:2s} {x: .8f} {y: .8f} {z: .8f}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def run_nve_md(
     sites: List[Site],
+    n_solvent_molecules: int,
     steps: int,
     dt_fs: float,
     write_frequency: int,
-    bond_distance: float,
+    solvent_bond_distance: float,
     trajectory_path: Path,
     energy_log_path: Path,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K\n", encoding="utf-8")
 
-    forces, potential = compute_forces_and_potential(sites)
+    forces, potential = compute_forces_and_potential(sites, n_solvent_molecules)
 
     for step in range(steps + 1):
         kinetic = kinetic_energy_kcal_mol(sites)
@@ -344,7 +564,6 @@ def run_nve_md(
         if step == steps:
             break
 
-        # velocity-Verlet: half-kick
         for idx, site in enumerate(sites):
             inv_mass = 1.0 / site.mass_amu
             ax = forces[idx][0] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
@@ -354,19 +573,15 @@ def run_nve_md(
             site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
-        # drift
         for site in sites:
             site.position_angstrom[0] += dt_fs * site.velocity_ang_fs[0]
             site.position_angstrom[1] += dt_fs * site.velocity_ang_fs[1]
             site.position_angstrom[2] += dt_fs * site.velocity_ang_fs[2]
 
-        # constraints after drift
-        enforce_bond_constraints(sites, bond_distance)
+        enforce_solvent_bond_constraints(sites, n_solvent_molecules, solvent_bond_distance)
 
-        # new forces
-        new_forces, potential = compute_forces_and_potential(sites)
+        new_forces, potential = compute_forces_and_potential(sites, n_solvent_molecules)
 
-        # second half-kick
         for idx, site in enumerate(sites):
             inv_mass = 1.0 / site.mass_amu
             ax = new_forces[idx][0] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
@@ -376,20 +591,19 @@ def run_nve_md(
             site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
-        # velocity constraints after second half-kick
-        enforce_velocity_constraints(sites)
+        enforce_solvent_velocity_constraints(sites, n_solvent_molecules)
 
         forces = new_forces
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate and run NVE MD for coarse-grained chloromethane solvent."
+        description="Generate and run NVE MD for coarse-grained chloromethane + AHB complex."
     )
     parser.add_argument("--n-molecules", type=int, default=7)
     parser.add_argument("--temperature", type=float, default=50.0, help="Kelvin")
     parser.add_argument("--radius", type=float, default=7.0, help="Angstrom")
-    parser.add_argument("--bond-distance", type=float, default=1.7, help="Angstrom")
+    parser.add_argument("--bond-distance", type=float, default=1.7, help="Angstrom (solvent C1-C2)")
     parser.add_argument("--min-distance", type=float, default=3.0, help="Angstrom")
     parser.add_argument("--seed", type=int, default=20260218)
 
@@ -397,6 +611,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dt-fs", type=float, default=1.0)
     parser.add_argument("--write-frequency", type=int, default=100)
 
+    parser.add_argument("--initial-output", type=Path, default=Path("solvent_initial.xyz"))
     parser.add_argument("--trajectory", type=Path, default=Path("solvent_nve.xyz"))
     parser.add_argument("--energy-log", type=Path, default=Path("solvent_energy.log"))
     return parser.parse_args()
@@ -415,21 +630,32 @@ def main() -> None:
     )
 
     initial_ke = kinetic_energy_kcal_mol(sites)
-    _, initial_pe = compute_forces_and_potential(sites)
+    _, initial_pe = compute_forces_and_potential(sites, args.n_molecules)
     initial_temp = instantaneous_temperature(sites)
+
+    write_initial_xyz(
+        args.initial_output,
+        sites,
+        (
+            "initial frame chloromethane+AHB "
+            f"molecules={args.n_molecules} T_target={args.temperature:.2f}K "
+            f"T_inst={initial_temp:.2f}K seed={args.seed} TE={initial_ke + initial_pe:.3f}kcal/mol"
+        ),
+    )
 
     run_nve_md(
         sites=sites,
+        n_solvent_molecules=args.n_molecules,
         steps=args.steps,
         dt_fs=args.dt_fs,
         write_frequency=args.write_frequency,
-        bond_distance=args.bond_distance,
+        solvent_bond_distance=args.bond_distance,
         trajectory_path=args.trajectory,
         energy_log_path=args.energy_log,
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
-    _, final_pe = compute_forces_and_potential(sites)
+    _, final_pe = compute_forces_and_potential(sites, args.n_molecules)
     final_temp = instantaneous_temperature(sites)
 
     print(f"Initial KE: {initial_ke:.6f} kcal/mol")
@@ -440,6 +666,7 @@ def main() -> None:
     print(f"Final PE: {final_pe:.6f} kcal/mol")
     print(f"Final TE: {final_ke + final_pe:.6f} kcal/mol")
     print(f"Final temperature: {final_temp:.3f} K")
+    print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
     print(f"Energy log written to: {args.energy_log}")
 
