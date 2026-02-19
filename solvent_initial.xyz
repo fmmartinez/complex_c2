@@ -1,5 +1,5 @@
 17
-initial frame chloromethane+AHB molecules=7 T_target=50.00K T_inst=36.68K seed=20260218 TE=71.750kcal/mol
+initial frame chloromethane+AHB molecules=7 T_target=50.00K T_inst=36.68K seed=20260218 TE=71.773kcal/mol Q_A=-0.5099 Q_H=0.5000 Q_B=0.0099
 C   1.88108990  1.86349234  5.62299317
 Cl  1.05615644  2.67281205  6.86978361
 C   1.14154998  2.44710033 -0.59695312
