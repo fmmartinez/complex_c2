@@ -524,6 +524,72 @@ def generate_configuration(
     return sites
 
 
+
+
+def compute_observables(sites: List[Site], n_solvent_molecules: int) -> Tuple[float, float]:
+    idx_a = idx_b = None
+    for idx, site in enumerate(sites):
+        if site.site_type == "A":
+            idx_a = idx
+        elif site.site_type == "B":
+            idx_b = idx
+    if idx_a is None or idx_b is None:
+        return 0.0, 0.0
+
+    ra = sites[idx_a].position_angstrom
+    rb = sites[idx_b].position_angstrom
+    vab = [rb[k] - ra[k] for k in range(3)]
+    rab = norm(vab)
+    uab = [v / max(rab, 1e-12) for v in vab]
+
+    s1 = [ra[k] + 1.0 * uab[k] for k in range(3)]
+    s2 = [ra[k] + 1.6 * uab[k] for k in range(3)]
+
+    dE = 0.0
+    for i in range(2 * n_solvent_molecules):
+        si = sites[i]
+        qi = CHARGE[si.site_type]
+        dx1 = si.position_angstrom[0] - s1[0]
+        dy1 = si.position_angstrom[1] - s1[1]
+        dz1 = si.position_angstrom[2] - s1[2]
+        r1 = math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1)
+
+        dx2 = si.position_angstrom[0] - s2[0]
+        dy2 = si.position_angstrom[1] - s2[1]
+        dz2 = si.position_angstrom[2] - s2[2]
+        r2 = math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2)
+
+        dE += qi * ((1.0 / max(r1, 1e-12)) - (1.0 / max(r2, 1e-12)))
+
+    m_a = MASS["A"]
+    m_b = MASS["B"]
+    m_ab = m_a + m_b
+    com_complex = [
+        (m_a * ra[0] + m_b * rb[0]) / m_ab,
+        (m_a * ra[1] + m_b * rb[1]) / m_ab,
+        (m_a * ra[2] + m_b * rb[2]) / m_ab,
+    ]
+
+    m_sol = 0.0
+    com_sol = [0.0, 0.0, 0.0]
+    for i in range(2 * n_solvent_molecules):
+        si = sites[i]
+        m = si.mass_amu
+        m_sol += m
+        com_sol[0] += m * si.position_angstrom[0]
+        com_sol[1] += m * si.position_angstrom[1]
+        com_sol[2] += m * si.position_angstrom[2]
+    if m_sol > 0.0:
+        com_sol = [c / m_sol for c in com_sol]
+
+    dx = com_complex[0] - com_sol[0]
+    dy = com_complex[1] - com_sol[1]
+    dz = com_complex[2] - com_sol[2]
+    r_com = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    return dE, r_com
+
+
 def run_nve_md(
     sites: List[Site],
     n_solvent_molecules: int,
@@ -540,6 +606,7 @@ def run_nve_md(
     mapping_seed: int,
     h_matrix_log_path: Path,
     mapping_log_path: Path,
+    observables_log_path: Path,
 ) -> None:
     diabatic_table = load_diabatic_tables(diabatic_path)
     r_min, r_max = diabatic_r_range(diabatic_table)
@@ -559,6 +626,10 @@ def run_nve_md(
     )
     mapping_log_path.write_text(
         "step time_fs M1 M2 M3 R1 P1 R2 P2 R3 P3\n",
+        encoding="utf-8",
+    )
+    observables_log_path.write_text(
+        "step time_fs dE_pol COM_distance\n",
         encoding="utf-8",
     )
 
@@ -586,6 +657,10 @@ def run_nve_md(
                 f"{h_eff[1][0]:.10f} {h_eff[1][1]:.10f} {h_eff[1][2]:.10f} "
                 f"{h_eff[2][0]:.10f} {h_eff[2][1]:.10f} {h_eff[2][2]:.10f}\n"
             )
+
+        dE_pol, r_com = compute_observables(sites, n_solvent_molecules)
+        with observables_log_path.open("a", encoding="utf-8") as fo:
+            fo.write(f"{step} {step * dt_fs:.6f} {dE_pol:.10f} {r_com:.10f}\n")
 
         temperature = instantaneous_temperature([s for s in sites if s.site_type != "H"], remove_momentum_dof=False)
         max_force = max(math.sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) for f in forces)

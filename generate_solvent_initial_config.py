@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-log", type=Path, default=Path("pbme_energy.log"))
     parser.add_argument("--h-matrix-log", type=Path, default=Path("pbme_effective_hamiltonian.log"))
     parser.add_argument("--mapping-log", type=Path, default=Path("pbme_mapping.log"))
+    parser.add_argument("--observables-log", type=Path, default=Path("pbme_observables.log"))
     parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
     parser.add_argument("--validate-forces", action="store_true", help="Run finite-difference force spot checks")
     parser.add_argument("--fd-delta", type=float, default=1e-4, help="Finite-difference displacement in Angstrom")
@@ -93,6 +94,7 @@ def main() -> None:
         mapping_seed=mapping_seed,
         h_matrix_log_path=args.h_matrix_log,
         mapping_log_path=args.mapping_log,
+        observables_log_path=args.observables_log,
     )
 
     print(f"Initial temperature: {initial_temp:.3f} K")
@@ -108,6 +110,7 @@ def main() -> None:
     print(f"Energy log written to: {args.energy_log}")
     print(f"Effective Hamiltonian log written to: {args.h_matrix_log}")
     print(f"Mapping variables log written to: {args.mapping_log}")
+    print(f"Observables log written to: {args.observables_log}")
 
 
 if __name__ == "__main__":
