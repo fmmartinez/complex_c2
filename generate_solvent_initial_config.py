@@ -66,7 +66,7 @@ AHB_PARAMS = {
     "n_B": 11.42,
 }
 
-HBAR_MAPPING = 1.0
+HBAR_MAPPING = 0.01594  # (kcal/mol)*fs
 RAB_MIN = 2.65
 RAB_MAX = 2.75
 PROTON_GRID_MIN = 0.3
@@ -579,12 +579,13 @@ def compute_pbme_forces_and_hamiltonian(
         k_total += 0.5 * site.mass_amu * (vx * vx + vy * vy + vz * vz)
     k_total *= AMU_ANG2_FS2_TO_KCAL_MOL
 
+    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(3)] for i in range(3)]
+
     e_h = 0.0
     dE_dR = 0.0
     for i in range(3):
         for j in range(3):
-            hij_tot = h_diab[i][j] + v_cs[i][j]
-            e_h += hij_tot * s_map[i][j]
+            e_h += h_eff[i][j] * s_map[i][j]
             dE_dR += dh_diab[i][j] * s_map[i][j]
     e_h /= (2.0 * HBAR_MAPPING)
     dE_dR /= (2.0 * HBAR_MAPPING)
@@ -604,6 +605,7 @@ def compute_pbme_forces_and_hamiltonian(
         "H_map": h_map,
         "R_AB": r_ab,
         "dE_dRAB": dE_dR,
+        "h_eff": h_eff,
     }
 
 
@@ -960,6 +962,7 @@ def run_nve_md(
     fd_delta: float,
     occupied_state: int,
     mapping_seed: int,
+    h_matrix_log_path: Path,
 ) -> None:
     del steps, dt_fs, write_frequency, solvent_bond_distance
     diabatic_table = load_diabatic_tables(diabatic_path)
@@ -974,6 +977,10 @@ def run_nve_md(
     energy_log_path.write_text(
         "step time_fs R_AB K_kcal_mol V_SS_kcal_mol E_map_coupling_kcal_mol H_map_kcal_mol dE_dRAB_kcal_mol_A "
         "R1 P1 R2 P2 R3 P3 fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err\n",
+        encoding="utf-8",
+    )
+    h_matrix_log_path.write_text(
+        "step time_fs R_AB h11 h12 h13 h21 h22 h23 h31 h32 h33\n",
         encoding="utf-8",
     )
 
@@ -1004,6 +1011,15 @@ def run_nve_md(
             f"{map_r[0]:.10f} {map_p[0]:.10f} {map_r[1]:.10f} {map_p[1]:.10f} {map_r[2]:.10f} {map_p[2]:.10f} "
             f"{fd_summary['fd_count']:.0f} {fd_summary['fd_delta']:.6f} {fd_summary['fd_max_abs_err']:.10e} "
             f"{fd_summary['fd_max_rel_err']:.10e} {fd_summary['fd_mean_abs_err']:.10e}\n"
+        )
+
+    with h_matrix_log_path.open("a", encoding="utf-8") as fh:
+        h_eff = terms["h_eff"]
+        fh.write(
+            f"0 0.000000 {terms['R_AB']:.8f} "
+            f"{h_eff[0][0]:.10f} {h_eff[0][1]:.10f} {h_eff[0][2]:.10f} "
+            f"{h_eff[1][0]:.10f} {h_eff[1][1]:.10f} {h_eff[1][2]:.10f} "
+            f"{h_eff[2][0]:.10f} {h_eff[2][1]:.10f} {h_eff[2][2]:.10f}\n"
         )
 
     max_force = max(math.sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) for f in forces)
@@ -1038,6 +1054,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-output", type=Path, default=Path("solvent_initial.xyz"))
     parser.add_argument("--trajectory", type=Path, default=Path("solvent_nve.xyz"))
     parser.add_argument("--energy-log", type=Path, default=Path("solvent_energy.log"))
+    parser.add_argument("--h-matrix-log", type=Path, default=Path("effective_hamiltonian.log"))
     parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
     parser.add_argument("--validate-forces", action="store_true", help="Run finite-difference force spot checks")
     parser.add_argument("--fd-delta", type=float, default=1e-4, help="Finite-difference displacement in Angstrom")
@@ -1098,6 +1115,7 @@ def main() -> None:
         fd_delta=args.fd_delta,
         occupied_state=args.occupied_state - 1,
         mapping_seed=mapping_seed,
+        h_matrix_log_path=args.h_matrix_log,
     )
 
     print(f"Initial temperature: {initial_temp:.3f} K")
@@ -1111,6 +1129,7 @@ def main() -> None:
     print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
     print(f"Energy log written to: {args.energy_log}")
+    print(f"Effective Hamiltonian log written to: {args.h_matrix_log}")
 
 
 if __name__ == "__main__":
