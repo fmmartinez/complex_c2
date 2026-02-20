@@ -41,8 +41,6 @@ LJ_PARAMS: Dict[Tuple[str, str], Tuple[float, float]] = {
 }
 
 HBAR_MAPPING = 0.01594  # (kcal/mol)*fs
-RAB_MIN = 2.65
-RAB_MAX = 2.75
 PROTON_GRID_MIN = 0.3
 PROTON_GRID_STEP = 0.02
 

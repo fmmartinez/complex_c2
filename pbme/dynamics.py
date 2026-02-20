@@ -5,7 +5,7 @@ import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from .diabatic import interpolate_eigenstates, interpolate_h_diabatic, load_diabatic_tables
+from .diabatic import diabatic_r_range, interpolate_eigenstates, interpolate_h_diabatic, load_diabatic_tables
 from .io_utils import append_xyz_frame
 from .mapping import propagate_mapping_exact_half_step, sample_focused_mapping_variables
 from .model import (
@@ -16,8 +16,6 @@ from .model import (
     MASS,
     POLARIZATION,
     PROTON_GRID_STEP,
-    RAB_MAX,
-    RAB_MIN,
     Site,
     coulomb_energy_dudr,
     dist,
@@ -55,8 +53,9 @@ def compute_pbme_forces_and_hamiltonian(
     rb = sites[idx_b].position_angstrom
     dab = [rb[k] - ra[k] for k in range(3)]
     r_ab = norm(dab)
-    if r_ab < RAB_MIN or r_ab > RAB_MAX:
-        raise RuntimeError(f"R_AB={r_ab:.6f} outside model validity window [{RAB_MIN:.2f}, {RAB_MAX:.2f}].")
+    r_min, r_max = diabatic_r_range(diabatic_table)
+    if r_ab < r_min or r_ab > r_max:
+        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
     uab = [dab[k] / max(r_ab, 1e-12) for k in range(3)]
 
     h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
@@ -543,6 +542,8 @@ def run_nve_md(
     mapping_log_path: Path,
 ) -> None:
     diabatic_table = load_diabatic_tables(diabatic_path)
+    r_min, r_max = diabatic_r_range(diabatic_table)
+    print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
     mapping_rng = random.Random(mapping_seed)
     map_r, map_p = sample_focused_mapping_variables(3, occupied_state, mapping_rng)
 

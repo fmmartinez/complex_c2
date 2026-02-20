@@ -132,3 +132,8 @@ def interpolate_eigenstates(di_table: Dict[str, object], r_ab: float) -> List[Li
                 out.append(st)
             return out
     return [row[:] for row in states_all[0]]
+
+
+def diabatic_r_range(di_table: Dict[str, object]) -> Tuple[float, float]:
+    r_values = di_table["r_values"]
+    return float(r_values[0]), float(r_values[-1])
