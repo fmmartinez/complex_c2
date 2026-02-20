@@ -609,6 +609,20 @@ def compute_pbme_forces_and_hamiltonian(
     }
 
 
+def compute_mapping_derivatives(h_eff: List[List[float]], map_r: List[float], map_p: List[float]) -> Tuple[List[float], List[float]]:
+    dr_dt = [0.0, 0.0, 0.0]
+    dp_dt = [0.0, 0.0, 0.0]
+    for i in range(3):
+        val_r = 0.0
+        val_p = 0.0
+        for j in range(3):
+            val_r += h_eff[i][j] * map_p[j]
+            val_p += h_eff[i][j] * map_r[j]
+        dr_dt[i] = val_r / HBAR_MAPPING
+        dp_dt[i] = -val_p / HBAR_MAPPING
+    return dr_dt, dp_dt
+
+
 def sample_focused_mapping_variables(
     n_states: int,
     occupied_state: int,
@@ -964,7 +978,6 @@ def run_nve_md(
     mapping_seed: int,
     h_matrix_log_path: Path,
 ) -> None:
-    del steps, dt_fs, write_frequency, solvent_bond_distance
     diabatic_table = load_diabatic_tables(diabatic_path)
     mapping_rng = random.Random(mapping_seed)
     map_r, map_p = sample_focused_mapping_variables(
@@ -976,7 +989,7 @@ def run_nve_md(
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text(
         "step time_fs R_AB K_kcal_mol V_SS_kcal_mol E_map_coupling_kcal_mol H_map_kcal_mol dE_dRAB_kcal_mol_A "
-        "R1 P1 R2 P2 R3 P3 fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err\n",
+        "M1 M2 M3 R1 P1 R2 P2 R3 P3 fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err\n",
         encoding="utf-8",
     )
     h_matrix_log_path.write_text(
@@ -984,8 +997,48 @@ def run_nve_md(
         encoding="utf-8",
     )
 
-    forces, terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p)
-    temperature = instantaneous_temperature([s for s in sites if s.site_type != "H"], remove_momentum_dof=False)
+    def append_logs(step: int, terms: Dict[str, object], fd_summary: Dict[str, float]) -> None:
+        m_norms = [map_r[i] * map_r[i] + map_p[i] * map_p[i] for i in range(3)]
+        with energy_log_path.open("a", encoding="utf-8") as flog:
+            flog.write(
+                f"{step} {step * dt_fs:.6f} {float(terms['R_AB']):.8f} {float(terms['K']):.10f} {float(terms['V_SS']):.10f} "
+                f"{float(terms['E_map_coupling']):.10f} {float(terms['H_map']):.10f} {float(terms['dE_dRAB']):.10f} "
+                f"{m_norms[0]:.10f} {m_norms[1]:.10f} {m_norms[2]:.10f} "
+                f"{map_r[0]:.10f} {map_p[0]:.10f} {map_r[1]:.10f} {map_p[1]:.10f} {map_r[2]:.10f} {map_p[2]:.10f} "
+                f"{fd_summary['fd_count']:.0f} {fd_summary['fd_delta']:.6f} {fd_summary['fd_max_abs_err']:.10e} "
+                f"{fd_summary['fd_max_rel_err']:.10e} {fd_summary['fd_mean_abs_err']:.10e}\n"
+            )
+
+        with h_matrix_log_path.open("a", encoding="utf-8") as fh:
+            h_eff = terms["h_eff"]
+            fh.write(
+                f"{step} {step * dt_fs:.6f} {float(terms['R_AB']):.8f} "
+                f"{h_eff[0][0]:.10f} {h_eff[0][1]:.10f} {h_eff[0][2]:.10f} "
+                f"{h_eff[1][0]:.10f} {h_eff[1][1]:.10f} {h_eff[1][2]:.10f} "
+                f"{h_eff[2][0]:.10f} {h_eff[2][1]:.10f} {h_eff[2][2]:.10f}\n"
+            )
+
+        temperature = instantaneous_temperature([s for s in sites if s.site_type != "H"], remove_momentum_dof=False)
+        max_force = max(math.sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) for f in forces)
+        append_xyz_frame(
+            trajectory_path,
+            sites,
+            (
+                f"step={step} time_fs={step * dt_fs:.3f} "
+                f"R_AB={float(terms['R_AB']):.6f} H_map={float(terms['H_map']):.6f} "
+                f"K={float(terms['K']):.6f} V_SS={float(terms['V_SS']):.6f} E_map={float(terms['E_map_coupling']):.6f} "
+                f"M=({m_norms[0]:.3f},{m_norms[1]:.3f},{m_norms[2]:.3f}) "
+                f"T_noH={temperature:.3f} max|F|={max_force:.6f} occ={occupied_state + 1} "
+                f"FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
+            ),
+        )
+
+    try:
+        forces, terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p)
+    except RuntimeError as exc:
+        with energy_log_path.open("a", encoding="utf-8") as flog:
+            flog.write(f"# terminated at step 0: {exc}\n")
+        return
 
     fd_summary = {
         "fd_count": 0.0,
@@ -1004,14 +1057,71 @@ def run_nve_md(
             delta=fd_delta,
         )
 
-    with energy_log_path.open("a", encoding="utf-8") as flog:
-        flog.write(
-            f"0 0.000000 {terms['R_AB']:.8f} {terms['K']:.10f} {terms['V_SS']:.10f} "
-            f"{terms['E_map_coupling']:.10f} {terms['H_map']:.10f} {terms['dE_dRAB']:.10f} "
-            f"{map_r[0]:.10f} {map_p[0]:.10f} {map_r[1]:.10f} {map_p[1]:.10f} {map_r[2]:.10f} {map_p[2]:.10f} "
-            f"{fd_summary['fd_count']:.0f} {fd_summary['fd_delta']:.6f} {fd_summary['fd_max_abs_err']:.10e} "
-            f"{fd_summary['fd_max_rel_err']:.10e} {fd_summary['fd_mean_abs_err']:.10e}\n"
-        )
+    for step in range(steps + 1):
+        if step % write_frequency == 0:
+            append_logs(step, terms, fd_summary)
+
+        if step == steps:
+            break
+
+        for idx, site in enumerate(sites):
+            if site.site_type == "H":
+                continue
+            inv_mass = 1.0 / site.mass_amu
+            ax = forces[idx][0] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            ay = forces[idx][1] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            az = forces[idx][2] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            site.velocity_ang_fs[0] += 0.5 * dt_fs * ax
+            site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
+            site.velocity_ang_fs[2] += 0.5 * dt_fs * az
+
+        dmap_r, dmap_p = compute_mapping_derivatives(terms["h_eff"], map_r, map_p)
+        for i in range(3):
+            map_r[i] += 0.5 * dt_fs * dmap_r[i]
+            map_p[i] += 0.5 * dt_fs * dmap_p[i]
+
+        for site in sites:
+            if site.site_type == "H":
+                continue
+            site.position_angstrom[0] += dt_fs * site.velocity_ang_fs[0]
+            site.position_angstrom[1] += dt_fs * site.velocity_ang_fs[1]
+            site.position_angstrom[2] += dt_fs * site.velocity_ang_fs[2]
+
+    trajectory_path.write_text("", encoding="utf-8")
+    energy_log_path.write_text(
+        "step time_fs R_AB K_kcal_mol V_SS_kcal_mol E_map_coupling_kcal_mol H_map_kcal_mol dE_dRAB_kcal_mol_A "
+        "R1 P1 R2 P2 R3 P3 fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err\n",
+        encoding="utf-8",
+    )
+    h_matrix_log_path.write_text(
+        "step time_fs R_AB h11 h12 h13 h21 h22 h23 h31 h32 h33\n",
+        encoding="utf-8",
+    )
+
+        try:
+            new_forces, new_terms = compute_pbme_forces_and_hamiltonian(
+                sites, n_solvent_molecules, diabatic_table, map_r, map_p
+            )
+        except RuntimeError as exc:
+            with energy_log_path.open("a", encoding="utf-8") as flog:
+                flog.write(f"# terminated at step {step + 1}: {exc}\n")
+            break
+
+        dmap_r, dmap_p = compute_mapping_derivatives(new_terms["h_eff"], map_r, map_p)
+        for i in range(3):
+            map_r[i] += 0.5 * dt_fs * dmap_r[i]
+            map_p[i] += 0.5 * dt_fs * dmap_p[i]
+
+        for idx, site in enumerate(sites):
+            if site.site_type == "H":
+                continue
+            inv_mass = 1.0 / site.mass_amu
+            ax = new_forces[idx][0] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            ay = new_forces[idx][1] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            az = new_forces[idx][2] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            site.velocity_ang_fs[0] += 0.5 * dt_fs * ax
+            site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
+            site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
     with h_matrix_log_path.open("a", encoding="utf-8") as fh:
         h_eff = terms["h_eff"]
@@ -1022,18 +1132,15 @@ def run_nve_md(
             f"{h_eff[2][0]:.10f} {h_eff[2][1]:.10f} {h_eff[2][2]:.10f}\n"
         )
 
-    max_force = max(math.sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) for f in forces)
-    append_xyz_frame(
-        trajectory_path,
-        sites,
-        (
-            "step=0 time_fs=0.000 "
-            f"R_AB={terms['R_AB']:.6f} H_map={terms['H_map']:.6f} "
-            f"K={terms['K']:.6f} V_SS={terms['V_SS']:.6f} E_map={terms['E_map_coupling']:.6f} "
-            f"T_noH={temperature:.3f} max|F|={max_force:.6f} "
-            f"occ={occupied_state + 1} FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
-        ),
-    )
+        terms = new_terms
+        forces = new_forces
+        fd_summary = {
+            "fd_count": 0.0,
+            "fd_delta": fd_delta,
+            "fd_max_abs_err": 0.0,
+            "fd_max_rel_err": 0.0,
+            "fd_mean_abs_err": 0.0,
+        }
 
 
 def parse_args() -> argparse.Namespace:
@@ -1047,9 +1154,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-distance", type=float, default=3.0, help="Angstrom")
     parser.add_argument("--seed", type=int, default=20260218)
 
-    parser.add_argument("--steps", type=int, default=0, help="Dynamics disabled; kept for interface compatibility")
-    parser.add_argument("--dt-fs", type=float, default=1.0)
-    parser.add_argument("--write-frequency", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--dt-fs", type=float, default=0.1)
+    parser.add_argument("--write-frequency", type=int, default=10)
 
     parser.add_argument("--initial-output", type=Path, default=Path("solvent_initial.xyz"))
     parser.add_argument("--trajectory", type=Path, default=Path("solvent_nve.xyz"))
@@ -1119,7 +1226,7 @@ def main() -> None:
     )
 
     print(f"Initial temperature: {initial_temp:.3f} K")
-    print("Dynamics is disabled in this PBME verification mode (step=0 only).")
+    print(f"PBME dynamics run complete (steps={args.steps}, dt_fs={args.dt_fs}).")
     if args.validate_forces:
         print(f"Finite-difference force checks enabled (delta={args.fd_delta:.2e} A).")
     print(
