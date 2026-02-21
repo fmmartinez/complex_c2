@@ -128,6 +128,7 @@ def main() -> None:
     print(f"Observables log written to: {args.observables_log}")
     print(f"Kernel backend: {args.kernel_backend}")
     print(f"Spherical wall radius: {wall_radius:.3f} A")
+    print("COM momentum removal frequency: 5000")
 
 
 if __name__ == "__main__":

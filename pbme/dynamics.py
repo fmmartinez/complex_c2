@@ -1002,14 +1002,13 @@ def run_nve_md(
     observables_log_path: Path,
     kernel_backend: str = "python",
     wall_radius_angstrom: float = 9.0,
-) -> None:
+ ) -> None:
     if kernel_backend not in {"python", "numba"}:
         raise ValueError("kernel_backend must be 'python' or 'numba'.")
     if kernel_backend == "numba" and not NUMBA_AVAILABLE:
         raise RuntimeError("Numba backend requested but numba is not installed.")
     if kernel_backend == "numba" and np is None:
         raise RuntimeError("Numba backend requested but numpy is not installed.")
-
     diabatic_table = load_diabatic_tables(diabatic_path)
     r_min, r_max = diabatic_r_range(diabatic_table)
     print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
@@ -1146,6 +1145,9 @@ def run_nve_md(
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
         enforce_solvent_velocity_constraints(sites, n_solvent_molecules)
+
+        if (step + 1) % 5000 == 0:
+            remove_net_linear_momentum(sites)
 
         terms = new_terms
         forces = new_forces
