@@ -7,6 +7,7 @@ import argparse
 import itertools
 import json
 import math
+import re
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -98,7 +99,18 @@ def main() -> None:
     parser.add_argument("--adiabatic-json", type=Path, default=Path("adiabatic_states.json"))
     parser.add_argument("--selected-states", type=str, default="1,2,3", help="1-based comma-separated adiabatic state indices")
     parser.add_argument("--output-json", type=Path, default=Path("diabatic_matrices.json"))
+    parser.add_argument(
+        "--plots-dir",
+        type=Path,
+        default=Path("diabatic_state_density_plots"),
+        help="Directory for per-R_AB diabatic |phi|^2 plots",
+    )
     args = parser.parse_args()
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for diabatic-state density plots. Install dependencies from requirements.txt") from exc
 
     ad = json.loads(args.adiabatic_json.read_text(encoding="utf-8"))
 
@@ -120,6 +132,9 @@ def main() -> None:
     n_basis = int(basis.shape[0])
     selected = parse_state_selection(args.selected_states, n_basis)
     n_sel = len(selected)
+
+    plots_dir = args.plots_dir
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
     prev_diab_grid = None
@@ -165,6 +180,21 @@ def main() -> None:
 
         prev_diab_grid = psi_dia.copy()
 
+        state_densities = psi_dia * psi_dia
+        r_tag = re.sub(r"[^0-9A-Za-z_.-]", "_", f"{r_ab:.4f}")
+        plot_path = plots_dir / f"diabatic_state_densities_R_{r_tag}.png"
+
+        plt.figure(figsize=(7, 5))
+        for i_state in range(n_sel):
+            plt.plot(r_grid, state_densities[i_state], linewidth=1.2, label=f"state {i_state + 1}")
+        plt.xlabel(r"$r_{AH}$ ($\AA$)")
+        plt.ylabel(r"$|\phi|^2$")
+        plt.title(f"Diabatic state densities at R_AB={r_ab:.4f} A")
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=180)
+        plt.close()
+
         results.append(
             {
                 "R": float(r_ab),
@@ -176,6 +206,8 @@ def main() -> None:
                 "hamiltonian_reduced_adiabatic": h_adi.tolist(),
                 "hamiltonian_reduced_diabatic": h_dia.tolist(),
                 "r_diagonalized_eigenstates_grid": psi_dia.tolist(),
+                "r_diagonalized_state_densities_grid": state_densities.tolist(),
+                "r_diagonalized_states_plot": str(plot_path),
             }
         )
 
@@ -191,6 +223,7 @@ def main() -> None:
     args.output_json.write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(f"Wrote diabatic JSON: {args.output_json}")
     print(f"Selected adiabatic states (1-based): {[i+1 for i in selected]}")
+    print(f"Wrote diabatic density plots to: {plots_dir}")
 
 
 if __name__ == "__main__":
