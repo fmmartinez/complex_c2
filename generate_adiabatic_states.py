@@ -141,14 +141,18 @@ def build_basis(r_grid: np.ndarray, n_per_center: int, center_a: float, center_b
     return np.asarray(basis)
 
 
-def generalized_symmetric_eigh(h_mat: np.ndarray, s_mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def generalized_symmetric_eigh(h_mat: np.ndarray, s_mat: np.ndarray, regularization_floor: float = 1e-14) -> tuple[np.ndarray, np.ndarray]:
     s_vals, s_vecs = np.linalg.eigh(s_mat)
-    keep = s_vals > 1e-10
-    if not np.any(keep):
-        raise RuntimeError("Overlap matrix is numerically singular; no positive eigenvalues above threshold.")
+    max_eval = max(float(np.max(s_vals)), regularization_floor)
+    floor = max(regularization_floor, 1e-14 * max_eval)
 
-    x = s_vecs[:, keep] @ np.diag(1.0 / np.sqrt(s_vals[keep]))
+    # Keep full basis dimensionality by regularizing very small/negative overlap eigenvalues.
+    s_vals_reg = np.copy(s_vals)
+    s_vals_reg[s_vals_reg < floor] = floor
+
+    x = s_vecs @ np.diag(1.0 / np.sqrt(s_vals_reg))
     h_ortho = x.T @ h_mat @ x
+    h_ortho = 0.5 * (h_ortho + h_ortho.T)
     e_vals, y_vecs = np.linalg.eigh(h_ortho)
     coeffs = x @ y_vecs
     return e_vals, coeffs
@@ -234,6 +238,7 @@ def main() -> None:
         "r_ab_values": r_ab_values,
         "eigenvalues": all_eigvals,
         "coefficients": all_coeffs,
+        "state_labels": [f"state_{i+1}" for i in range(n_basis)],
     }
 
     args.output_json.write_text(json.dumps(output, indent=2), encoding="utf-8")
@@ -242,10 +247,11 @@ def main() -> None:
     eigvals_arr = np.asarray(all_eigvals, dtype=float)
     plt.figure(figsize=(7, 5))
     for state in range(eigvals_arr.shape[1]):
-        plt.plot(x, eigvals_arr[:, state], linewidth=1.0)
+        plt.plot(x, eigvals_arr[:, state], linewidth=1.0, label=f"state {state + 1}")
     plt.xlabel(r"$R_{AB}$ ($\AA$)")
     plt.ylabel("Eigenvalue (kcal/mol)")
     plt.title("Adiabatic subsystem eigenvalues vs $R_{AB}$")
+    plt.legend(fontsize=7, ncol=2)
     plt.tight_layout()
     plt.savefig(args.output_plot, dpi=200)
 
