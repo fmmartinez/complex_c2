@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised when numpy is not installed.
+    np = None  # type: ignore[assignment]
+
+try:
     from numba import njit
 
     NUMBA_AVAILABLE = True
@@ -47,7 +52,6 @@ from .model import (
 )
 
 SITE_TYPE_TO_CODE = {"C1": 0, "C2": 1, "A": 2, "B": 3, "H": 4}
-CODE_TO_SITE_TYPE = {value: key for key, value in SITE_TYPE_TO_CODE.items()}
 Q_A_COV = POLARIZATION["Q_A_cov"]
 Q_H_COV = POLARIZATION["Q_H_cov"]
 Q_B_COV = POLARIZATION["Q_B_cov"]
@@ -112,24 +116,24 @@ def _get_lj_sigma_epsilon_numba(type_i: int, type_j: int) -> Tuple[float, float,
 
 @njit(cache=True)
 def _compute_forces_numba_core(
-    positions: List[List[float]],
-    velocities: List[List[float]],
-    masses: List[float],
-    molecule_ids: List[int],
-    type_codes: List[int],
+    positions: np.ndarray,
+    velocities: np.ndarray,
+    masses: np.ndarray,
+    molecule_ids: np.ndarray,
+    type_codes: np.ndarray,
     n_solvent_molecules: int,
-    grid: List[float],
-    eigenstates: List[List[float]],
-    h_diab: List[List[float]],
-    dh_diab: List[List[float]],
-    map_r: List[float],
-    map_p: List[float],
-) -> Tuple[List[List[float]], float, float, float, float, float, List[List[float]]]:
-    forces = [[0.0, 0.0, 0.0] for _ in range(len(positions))]
+    grid: np.ndarray,
+    eigenstates: np.ndarray,
+    h_diab: np.ndarray,
+    dh_diab: np.ndarray,
+    map_r: np.ndarray,
+    map_p: np.ndarray,
+) -> Tuple[np.ndarray, float, float, float, float, float, np.ndarray]:
+    forces = np.zeros((positions.shape[0], 3), dtype=np.float64)
     idx_a = -1
     idx_h = -1
     idx_b = -1
-    for idx in range(len(type_codes)):
+    for idx in range(type_codes.shape[0]):
         t = type_codes[idx]
         if t == 2:
             idx_a = idx
@@ -142,15 +146,19 @@ def _compute_forces_numba_core(
 
     ra = positions[idx_a]
     rb = positions[idx_b]
-    dab = [rb[k] - ra[k] for k in range(3)]
+    dab = np.empty(3, dtype=np.float64)
+    for k in range(3):
+        dab[k] = rb[k] - ra[k]
     r_ab = math.sqrt(dab[0] * dab[0] + dab[1] * dab[1] + dab[2] * dab[2])
-    uab = [dab[k] / max(r_ab, 1e-12) for k in range(3)]
+    uab = np.empty(3, dtype=np.float64)
+    for k in range(3):
+        uab[k] = dab[k] / max(r_ab, 1e-12)
 
     v_ss = 0.0
-    for i in range(len(positions)):
+    for i in range(positions.shape[0]):
         xi, yi, zi = positions[i][0], positions[i][1], positions[i][2]
         type_i = type_codes[i]
-        for j in range(i + 1, len(positions)):
+        for j in range(i + 1, positions.shape[0]):
             if molecule_ids[i] == molecule_ids[j] and molecule_ids[i] < n_solvent_molecules:
                 continue
             type_j = type_codes[j]
@@ -188,29 +196,34 @@ def _compute_forces_numba_core(
                     forces[j][1] -= fy
                     forces[j][2] -= fz
 
-    weights = [PROTON_GRID_STEP] * len(grid)
+    weights = np.full(grid.shape[0], PROTON_GRID_STEP, dtype=np.float64)
     weights[0] *= 0.5
     weights[-1] *= 0.5
 
-    s_map = [[map_r[i] * map_r[j] + map_p[i] * map_p[j] - (HBAR_MAPPING if i == j else 0.0) for j in range(3)] for i in range(3)]
+    s_map = np.zeros((3, 3), dtype=np.float64)
+    for i in range(3):
+        for j in range(3):
+            s_map[i, j] = map_r[i] * map_r[j] + map_p[i] * map_p[j] - (HBAR_MAPPING if i == j else 0.0)
 
-    omega = [0.0 for _ in range(len(grid))]
-    for g in range(len(grid)):
+    omega = np.zeros(grid.shape[0], dtype=np.float64)
+    for g in range(grid.shape[0]):
         tmp = 0.0
         for i in range(3):
             for j in range(3):
-                tmp += s_map[i][j] * eigenstates[i][g] * eigenstates[j][g]
+                tmp += s_map[i, j] * eigenstates[i, g] * eigenstates[j, g]
         omega[g] = tmp / (2.0 * HBAR_MAPPING)
 
-    v_cs = [[0.0, 0.0, 0.0] for _ in range(3)]
-    for g in range(len(grid)):
+    v_cs = np.zeros((3, 3), dtype=np.float64)
+    for g in range(grid.shape[0]):
         r_ah = grid[g]
         fpol, _ = _polarization_switch_numba(r_ah)
         q_a = (1.0 - fpol) * Q_A_COV + fpol * Q_A_ION
         q_h = (1.0 - fpol) * Q_H_COV + fpol * Q_H_ION
         q_b = (1.0 - fpol) * Q_B_COV + fpol * Q_B_ION
 
-        rh = [ra[k] + uab[k] * r_ah for k in range(3)]
+        rh = np.empty(3, dtype=np.float64)
+        for k in range(3):
+            rh[k] = ra[k] + uab[k] * r_ah
 
         for s_idx in range(2 * n_solvent_molecules):
             rs = positions[s_idx]
@@ -248,14 +261,17 @@ def _compute_forces_numba_core(
             wg = weights[g] * omega[g]
             for i in range(3):
                 for j in range(3):
-                    v_cs[i][j] += weights[g] * eigenstates[i][g] * eigenstates[j][g] * v_gs
+                    v_cs[i, j] += weights[g] * eigenstates[i, g] * eigenstates[j, g] * v_gs
 
             if abs(e_hs) > 0.0:
                 scale_h = -dUdr_hs / max(r_hs, 1e-12)
-                f_h = [scale_h * dx, scale_h * dy, scale_h * dz]
-                forces[s_idx][0] -= wg * f_h[0]
-                forces[s_idx][1] -= wg * f_h[1]
-                forces[s_idx][2] -= wg * f_h[2]
+                f_h = np.empty(3, dtype=np.float64)
+                f_h[0] = scale_h * dx
+                f_h[1] = scale_h * dy
+                f_h[2] = scale_h * dz
+                forces[s_idx, 0] -= wg * f_h[0]
+                forces[s_idx, 1] -= wg * f_h[1]
+                forces[s_idx, 2] -= wg * f_h[2]
 
                 ratio = r_ah / max(r_ab, 1e-12)
                 for a in range(3):
@@ -267,49 +283,56 @@ def _compute_forces_numba_core(
                         proj_b = ratio * (delta - uab[a] * uab[b])
                         sum_a += proj * f_h[b]
                         sum_b += proj_b * f_h[b]
-                    forces[idx_a][a] += wg * sum_a
-                    forces[idx_b][a] += wg * sum_b
+                    forces[idx_a, a] += wg * sum_a
+                    forces[idx_b, a] += wg * sum_b
 
             scale_a = -dUdr_as / max(r_as, 1e-12)
-            f_a = [scale_a * dxa, scale_a * dya, scale_a * dza]
-            forces[idx_a][0] += wg * f_a[0]
-            forces[idx_a][1] += wg * f_a[1]
-            forces[idx_a][2] += wg * f_a[2]
-            forces[s_idx][0] -= wg * f_a[0]
-            forces[s_idx][1] -= wg * f_a[1]
-            forces[s_idx][2] -= wg * f_a[2]
+            f_a0 = scale_a * dxa
+            f_a1 = scale_a * dya
+            f_a2 = scale_a * dza
+            forces[idx_a, 0] += wg * f_a0
+            forces[idx_a, 1] += wg * f_a1
+            forces[idx_a, 2] += wg * f_a2
+            forces[s_idx, 0] -= wg * f_a0
+            forces[s_idx, 1] -= wg * f_a1
+            forces[s_idx, 2] -= wg * f_a2
 
             scale_b = -dUdr_bs / max(r_bs, 1e-12)
-            f_b = [scale_b * dxb, scale_b * dyb, scale_b * dzb]
-            forces[idx_b][0] += wg * f_b[0]
-            forces[idx_b][1] += wg * f_b[1]
-            forces[idx_b][2] += wg * f_b[2]
-            forces[s_idx][0] -= wg * f_b[0]
-            forces[s_idx][1] -= wg * f_b[1]
-            forces[s_idx][2] -= wg * f_b[2]
+            f_b0 = scale_b * dxb
+            f_b1 = scale_b * dyb
+            f_b2 = scale_b * dzb
+            forces[idx_b, 0] += wg * f_b0
+            forces[idx_b, 1] += wg * f_b1
+            forces[idx_b, 2] += wg * f_b2
+            forces[s_idx, 0] -= wg * f_b0
+            forces[s_idx, 1] -= wg * f_b1
+            forces[s_idx, 2] -= wg * f_b2
 
     k_total = 0.0
-    for i in range(len(positions)):
+    for i in range(positions.shape[0]):
         if type_codes[i] == 4:
             continue
         vx, vy, vz = velocities[i][0], velocities[i][1], velocities[i][2]
         k_total += 0.5 * masses[i] * (vx * vx + vy * vy + vz * vz)
     k_total *= AMU_ANG2_FS2_TO_KCAL_MOL
 
-    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(3)] for i in range(3)]
+    h_eff = np.zeros((3, 3), dtype=np.float64)
+    for i in range(3):
+        for j in range(3):
+            h_eff[i, j] = h_diab[i, j] + v_cs[i, j]
     e_h = 0.0
     dE_dR = 0.0
     for i in range(3):
         for j in range(3):
-            e_h += h_eff[i][j] * s_map[i][j]
-            dE_dR += dh_diab[i][j] * s_map[i][j]
+            e_h += h_eff[i, j] * s_map[i, j]
+            dE_dR += dh_diab[i, j] * s_map[i, j]
     e_h /= 2.0 * HBAR_MAPPING
     dE_dR /= 2.0 * HBAR_MAPPING
 
     for k in range(3):
         f_b = -dE_dR * uab[k]
-        forces[idx_b][k] += f_b
-        forces[idx_a][k] -= f_b
+        forces[idx_b, k] += f_b
+        forces[idx_a, k] -= f_b
 
     h_map = k_total + v_ss + e_h
     return forces, k_total, v_ss, e_h, h_map, dE_dR, h_eff
@@ -352,12 +375,14 @@ def compute_pbme_forces_and_hamiltonian(
     if kernel_backend == "numba":
         if not NUMBA_AVAILABLE:
             raise RuntimeError("Numba backend requested but numba is not installed.")
+        if np is None:
+            raise RuntimeError("Numba backend requested but numpy is not installed.")
 
-        positions = [list(s.position_angstrom) for s in sites]
-        velocities = [list(s.velocity_ang_fs) for s in sites]
-        masses = [s.mass_amu for s in sites]
-        molecule_ids = [s.molecule_id for s in sites]
-        type_codes = [SITE_TYPE_TO_CODE[s.site_type] for s in sites]
+        positions = np.asarray([s.position_angstrom for s in sites], dtype=np.float64)
+        velocities = np.asarray([s.velocity_ang_fs for s in sites], dtype=np.float64)
+        masses = np.asarray([s.mass_amu for s in sites], dtype=np.float64)
+        molecule_ids = np.asarray([s.molecule_id for s in sites], dtype=np.int64)
+        type_codes = np.asarray([SITE_TYPE_TO_CODE[s.site_type] for s in sites], dtype=np.int64)
         forces, k_total, v_ss, e_h, h_map, dE_dR, h_eff = _compute_forces_numba_core(
             positions=positions,
             velocities=velocities,
@@ -365,21 +390,21 @@ def compute_pbme_forces_and_hamiltonian(
             molecule_ids=molecule_ids,
             type_codes=type_codes,
             n_solvent_molecules=n_solvent_molecules,
-            grid=list(grid),
-            eigenstates=[list(row) for row in eigenstates],
-            h_diab=[list(row) for row in h_diab],
-            dh_diab=[list(row) for row in dh_diab],
-            map_r=list(map_r),
-            map_p=list(map_p),
+            grid=np.asarray(grid, dtype=np.float64),
+            eigenstates=np.asarray(eigenstates, dtype=np.float64),
+            h_diab=np.asarray(h_diab, dtype=np.float64),
+            dh_diab=np.asarray(dh_diab, dtype=np.float64),
+            map_r=np.asarray(map_r, dtype=np.float64),
+            map_p=np.asarray(map_p, dtype=np.float64),
         )
-        return forces, {
+        return forces.tolist(), {
             "K": k_total,
             "V_SS": v_ss,
             "E_map_coupling": e_h,
             "H_map": h_map,
             "R_AB": r_ab,
             "dE_dRAB": dE_dR,
-            "h_eff": h_eff,
+            "h_eff": h_eff.tolist(),
         }
 
     forces = [[0.0, 0.0, 0.0] for _ in sites]
@@ -960,6 +985,8 @@ def run_nve_md(
         raise ValueError("kernel_backend must be 'python' or 'numba'.")
     if kernel_backend == "numba" and not NUMBA_AVAILABLE:
         raise RuntimeError("Numba backend requested but numba is not installed.")
+    if kernel_backend == "numba" and np is None:
+        raise RuntimeError("Numba backend requested but numpy is not installed.")
 
     diabatic_table = load_diabatic_tables(diabatic_path)
     r_min, r_max = diabatic_r_range(diabatic_table)
