@@ -5,11 +5,25 @@ import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+try:
+    from numba import njit
+
+    NUMBA_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised when numba is not installed.
+    NUMBA_AVAILABLE = False
+
+    def njit(*_args, **_kwargs):  # type: ignore[no-redef]
+        def decorator(func):
+            return func
+
+        return decorator
+
 from .diabatic import diabatic_r_range, interpolate_eigenstates, interpolate_h_diabatic, load_diabatic_tables
 from .io_utils import append_xyz_frame
 from .mapping import propagate_mapping_exact_half_step, sample_focused_mapping_variables
 from .model import (
     CHARGE,
+    COULOMB_KCAL_MOL_ANG_E2,
     HBAR_MAPPING,
     KCAL_MOL_ANG_TO_AMU_ANG_FS2,
     LABEL,
@@ -32,10 +46,342 @@ from .model import (
     sample_velocity,
 )
 
+SITE_TYPE_TO_CODE = {"C1": 0, "C2": 1, "A": 2, "B": 3, "H": 4}
+CODE_TO_SITE_TYPE = {value: key for key, value in SITE_TYPE_TO_CODE.items()}
+Q_A_COV = POLARIZATION["Q_A_cov"]
+Q_H_COV = POLARIZATION["Q_H_cov"]
+Q_B_COV = POLARIZATION["Q_B_cov"]
+Q_A_ION = POLARIZATION["Q_A_ion"]
+Q_H_ION = POLARIZATION["Q_H_ion"]
+Q_B_ION = POLARIZATION["Q_B_ion"]
+R0_POL = POLARIZATION["r0"]
+L_POL = POLARIZATION["l"]
+AMU_ANG2_FS2_TO_KCAL_MOL = 2390.05736055072
+
+
+@njit(cache=True)
+def _lj_energy_dudr_numba(r: float, sigma: float, epsilon: float) -> Tuple[float, float]:
+    inv_r = 1.0 / max(r, 1e-12)
+    sr = sigma * inv_r
+    sr2 = sr * sr
+    sr6 = sr2 * sr2 * sr2
+    sr12 = sr6 * sr6
+    energy = 4.0 * epsilon * (sr12 - sr6)
+    dudr = 4.0 * epsilon * (-12.0 * sr12 * inv_r + 6.0 * sr6 * inv_r)
+    return energy, dudr
+
+
+@njit(cache=True)
+def _coulomb_energy_dudr_numba(r: float, qi: float, qj: float) -> Tuple[float, float]:
+    inv_r = 1.0 / max(r, 1e-12)
+    energy = COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r
+    dudr = -COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r * inv_r
+    return energy, dudr
+
+
+@njit(cache=True)
+def _polarization_switch_numba(r_ah: float) -> Tuple[float, float]:
+    dr = r_ah - R0_POL
+    l = L_POL
+    denom = math.sqrt(dr * dr + l * l)
+    f = 0.5 * (1.0 + dr / denom)
+    df_dr = 0.5 * (l * l) / (denom ** 3)
+    return f, df_dr
+
+
+@njit(cache=True)
+def _get_lj_sigma_epsilon_numba(type_i: int, type_j: int) -> Tuple[float, float, float]:
+    a = type_i if type_i <= type_j else type_j
+    b = type_j if type_i <= type_j else type_i
+
+    if a <= 1 and b <= 1:
+        sigma_a = 3.774 if a == 0 else 3.481
+        sigma_b = 3.774 if b == 0 else 3.481
+        epsilon_a = 0.238 if a == 0 else 0.415
+        epsilon_b = 0.238 if b == 0 else 0.415
+        return 1.0, 0.5 * (sigma_a + sigma_b), math.sqrt(epsilon_a * epsilon_b)
+
+    if (a == 2 or a == 3) and (b == 0 or b == 1):
+        return 1.0, 3.5, 0.3974
+
+    if a == 4 and (b == 0 or b == 1):
+        return 1.0, 3.5, 0.3974
+
+    return 0.0, 0.0, 0.0
+
+
+@njit(cache=True)
+def _compute_forces_numba_core(
+    positions: List[List[float]],
+    velocities: List[List[float]],
+    masses: List[float],
+    molecule_ids: List[int],
+    type_codes: List[int],
+    n_solvent_molecules: int,
+    grid: List[float],
+    eigenstates: List[List[float]],
+    h_diab: List[List[float]],
+    dh_diab: List[List[float]],
+    map_r: List[float],
+    map_p: List[float],
+) -> Tuple[List[List[float]], float, float, float, float, float, List[List[float]]]:
+    forces = [[0.0, 0.0, 0.0] for _ in range(len(positions))]
+    idx_a = -1
+    idx_h = -1
+    idx_b = -1
+    for idx in range(len(type_codes)):
+        t = type_codes[idx]
+        if t == 2:
+            idx_a = idx
+        elif t == 4:
+            idx_h = idx
+        elif t == 3:
+            idx_b = idx
+    if idx_a < 0 or idx_h < 0 or idx_b < 0:
+        raise RuntimeError("Complex A/H/B sites not found.")
+
+    ra = positions[idx_a]
+    rb = positions[idx_b]
+    dab = [rb[k] - ra[k] for k in range(3)]
+    r_ab = math.sqrt(dab[0] * dab[0] + dab[1] * dab[1] + dab[2] * dab[2])
+    uab = [dab[k] / max(r_ab, 1e-12) for k in range(3)]
+
+    v_ss = 0.0
+    for i in range(len(positions)):
+        xi, yi, zi = positions[i][0], positions[i][1], positions[i][2]
+        type_i = type_codes[i]
+        for j in range(i + 1, len(positions)):
+            if molecule_ids[i] == molecule_ids[j] and molecule_ids[i] < n_solvent_molecules:
+                continue
+            type_j = type_codes[j]
+            dx = xi - positions[j][0]
+            dy = yi - positions[j][1]
+            dz = zi - positions[j][2]
+            r = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            is_pair_solvent = type_i <= 1 and type_j <= 1
+            is_pair_ab_solvent = ((type_i == 2 or type_i == 3) and (type_j <= 1)) or ((type_j == 2 or type_j == 3) and (type_i <= 1))
+            if is_pair_solvent or is_pair_ab_solvent:
+                has_lj, sigma, epsilon = _get_lj_sigma_epsilon_numba(type_i, type_j)
+                if has_lj > 0.5:
+                    e_lj, dudr = _lj_energy_dudr_numba(r, sigma, epsilon)
+                    v_ss += e_lj
+                    scale = -dudr / max(r, 1e-12)
+                    fx, fy, fz = scale * dx, scale * dy, scale * dz
+                    forces[i][0] += fx
+                    forces[i][1] += fy
+                    forces[i][2] += fz
+                    forces[j][0] -= fx
+                    forces[j][1] -= fy
+                    forces[j][2] -= fz
+                if is_pair_solvent:
+                    qi = 0.25 if type_i == 0 else -0.25
+                    qj = 0.25 if type_j == 0 else -0.25
+                    e_c, dudr = _coulomb_energy_dudr_numba(r, qi, qj)
+                    v_ss += e_c
+                    scale = -dudr / max(r, 1e-12)
+                    fx, fy, fz = scale * dx, scale * dy, scale * dz
+                    forces[i][0] += fx
+                    forces[i][1] += fy
+                    forces[i][2] += fz
+                    forces[j][0] -= fx
+                    forces[j][1] -= fy
+                    forces[j][2] -= fz
+
+    weights = [PROTON_GRID_STEP] * len(grid)
+    weights[0] *= 0.5
+    weights[-1] *= 0.5
+
+    s_map = [[map_r[i] * map_r[j] + map_p[i] * map_p[j] - (HBAR_MAPPING if i == j else 0.0) for j in range(3)] for i in range(3)]
+
+    omega = [0.0 for _ in range(len(grid))]
+    for g in range(len(grid)):
+        tmp = 0.0
+        for i in range(3):
+            for j in range(3):
+                tmp += s_map[i][j] * eigenstates[i][g] * eigenstates[j][g]
+        omega[g] = tmp / (2.0 * HBAR_MAPPING)
+
+    v_cs = [[0.0, 0.0, 0.0] for _ in range(3)]
+    for g in range(len(grid)):
+        r_ah = grid[g]
+        fpol, _ = _polarization_switch_numba(r_ah)
+        q_a = (1.0 - fpol) * Q_A_COV + fpol * Q_A_ION
+        q_h = (1.0 - fpol) * Q_H_COV + fpol * Q_H_ION
+        q_b = (1.0 - fpol) * Q_B_COV + fpol * Q_B_ION
+
+        rh = [ra[k] + uab[k] * r_ah for k in range(3)]
+
+        for s_idx in range(2 * n_solvent_molecules):
+            rs = positions[s_idx]
+            qs = 0.25 if type_codes[s_idx] == 0 else -0.25
+
+            dx = rh[0] - rs[0]
+            dy = rh[1] - rs[1]
+            dz = rh[2] - rs[2]
+            r_hs = math.sqrt(dx * dx + dy * dy + dz * dz)
+            e_hs = 0.0
+            dUdr_hs = 0.0
+            has_lj_hs, sigma_hs, epsilon_hs = _get_lj_sigma_epsilon_numba(4, type_codes[s_idx])
+            if has_lj_hs > 0.5:
+                e_lj, d_lj = _lj_energy_dudr_numba(r_hs, sigma_hs, epsilon_hs)
+                e_hs += e_lj
+                dUdr_hs += d_lj
+            if abs(q_h * qs) > 0.0:
+                e_c, d_c = _coulomb_energy_dudr_numba(r_hs, q_h, qs)
+                e_hs += e_c
+                dUdr_hs += d_c
+
+            dxa = ra[0] - rs[0]
+            dya = ra[1] - rs[1]
+            dza = ra[2] - rs[2]
+            r_as = math.sqrt(dxa * dxa + dya * dya + dza * dza)
+            e_as, dUdr_as = _coulomb_energy_dudr_numba(r_as, q_a, qs)
+
+            dxb = rb[0] - rs[0]
+            dyb = rb[1] - rs[1]
+            dzb = rb[2] - rs[2]
+            r_bs = math.sqrt(dxb * dxb + dyb * dyb + dzb * dzb)
+            e_bs, dUdr_bs = _coulomb_energy_dudr_numba(r_bs, q_b, qs)
+
+            v_gs = e_hs + e_as + e_bs
+            wg = weights[g] * omega[g]
+            for i in range(3):
+                for j in range(3):
+                    v_cs[i][j] += weights[g] * eigenstates[i][g] * eigenstates[j][g] * v_gs
+
+            if abs(e_hs) > 0.0:
+                scale_h = -dUdr_hs / max(r_hs, 1e-12)
+                f_h = [scale_h * dx, scale_h * dy, scale_h * dz]
+                forces[s_idx][0] -= wg * f_h[0]
+                forces[s_idx][1] -= wg * f_h[1]
+                forces[s_idx][2] -= wg * f_h[2]
+
+                ratio = r_ah / max(r_ab, 1e-12)
+                for a in range(3):
+                    sum_a = 0.0
+                    sum_b = 0.0
+                    for b in range(3):
+                        delta = 1.0 if a == b else 0.0
+                        proj = delta - ratio * (delta - uab[a] * uab[b])
+                        proj_b = ratio * (delta - uab[a] * uab[b])
+                        sum_a += proj * f_h[b]
+                        sum_b += proj_b * f_h[b]
+                    forces[idx_a][a] += wg * sum_a
+                    forces[idx_b][a] += wg * sum_b
+
+            scale_a = -dUdr_as / max(r_as, 1e-12)
+            f_a = [scale_a * dxa, scale_a * dya, scale_a * dza]
+            forces[idx_a][0] += wg * f_a[0]
+            forces[idx_a][1] += wg * f_a[1]
+            forces[idx_a][2] += wg * f_a[2]
+            forces[s_idx][0] -= wg * f_a[0]
+            forces[s_idx][1] -= wg * f_a[1]
+            forces[s_idx][2] -= wg * f_a[2]
+
+            scale_b = -dUdr_bs / max(r_bs, 1e-12)
+            f_b = [scale_b * dxb, scale_b * dyb, scale_b * dzb]
+            forces[idx_b][0] += wg * f_b[0]
+            forces[idx_b][1] += wg * f_b[1]
+            forces[idx_b][2] += wg * f_b[2]
+            forces[s_idx][0] -= wg * f_b[0]
+            forces[s_idx][1] -= wg * f_b[1]
+            forces[s_idx][2] -= wg * f_b[2]
+
+    k_total = 0.0
+    for i in range(len(positions)):
+        if type_codes[i] == 4:
+            continue
+        vx, vy, vz = velocities[i][0], velocities[i][1], velocities[i][2]
+        k_total += 0.5 * masses[i] * (vx * vx + vy * vy + vz * vz)
+    k_total *= AMU_ANG2_FS2_TO_KCAL_MOL
+
+    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(3)] for i in range(3)]
+    e_h = 0.0
+    dE_dR = 0.0
+    for i in range(3):
+        for j in range(3):
+            e_h += h_eff[i][j] * s_map[i][j]
+            dE_dR += dh_diab[i][j] * s_map[i][j]
+    e_h /= 2.0 * HBAR_MAPPING
+    dE_dR /= 2.0 * HBAR_MAPPING
+
+    for k in range(3):
+        f_b = -dE_dR * uab[k]
+        forces[idx_b][k] += f_b
+        forces[idx_a][k] -= f_b
+
+    h_map = k_total + v_ss + e_h
+    return forces, k_total, v_ss, e_h, h_map, dE_dR, h_eff
+
 
 def compute_pbme_forces_and_hamiltonian(
-    sites: List[Site], n_solvent_molecules: int, diabatic_table: Dict[str, object], map_r: List[float], map_p: List[float]
+    sites: List[Site],
+    n_solvent_molecules: int,
+    diabatic_table: Dict[str, object],
+    map_r: List[float],
+    map_p: List[float],
+    kernel_backend: str = "python",
 ) -> Tuple[List[List[float]], Dict[str, object]]:
+    if kernel_backend not in {"python", "numba"}:
+        raise ValueError("kernel_backend must be 'python' or 'numba'.")
+
+    idx_a = idx_h = idx_b = None
+    for idx, site in enumerate(sites):
+        if site.site_type == "A":
+            idx_a = idx
+        elif site.site_type == "H":
+            idx_h = idx
+        elif site.site_type == "B":
+            idx_b = idx
+    if idx_a is None or idx_h is None or idx_b is None:
+        raise RuntimeError("Complex A/H/B sites not found.")
+
+    ra = sites[idx_a].position_angstrom
+    rb = sites[idx_b].position_angstrom
+    dab = [rb[k] - ra[k] for k in range(3)]
+    r_ab = norm(dab)
+    r_min, r_max = diabatic_r_range(diabatic_table)
+    if r_ab < r_min or r_ab > r_max:
+        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
+
+    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
+    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
+    grid = diabatic_table["grid"]
+
+    if kernel_backend == "numba":
+        if not NUMBA_AVAILABLE:
+            raise RuntimeError("Numba backend requested but numba is not installed.")
+
+        positions = [list(s.position_angstrom) for s in sites]
+        velocities = [list(s.velocity_ang_fs) for s in sites]
+        masses = [s.mass_amu for s in sites]
+        molecule_ids = [s.molecule_id for s in sites]
+        type_codes = [SITE_TYPE_TO_CODE[s.site_type] for s in sites]
+        forces, k_total, v_ss, e_h, h_map, dE_dR, h_eff = _compute_forces_numba_core(
+            positions=positions,
+            velocities=velocities,
+            masses=masses,
+            molecule_ids=molecule_ids,
+            type_codes=type_codes,
+            n_solvent_molecules=n_solvent_molecules,
+            grid=list(grid),
+            eigenstates=[list(row) for row in eigenstates],
+            h_diab=[list(row) for row in h_diab],
+            dh_diab=[list(row) for row in dh_diab],
+            map_r=list(map_r),
+            map_p=list(map_p),
+        )
+        return forces, {
+            "K": k_total,
+            "V_SS": v_ss,
+            "E_map_coupling": e_h,
+            "H_map": h_map,
+            "R_AB": r_ab,
+            "dE_dRAB": dE_dR,
+            "h_eff": h_eff,
+        }
+
     forces = [[0.0, 0.0, 0.0] for _ in sites]
 
     idx_a = idx_h = idx_b = None
@@ -252,8 +598,9 @@ def finite_difference_force_spot_checks(
     map_r: List[float],
     map_p: List[float],
     delta: float,
+    kernel_backend: str = "python",
 ) -> Dict[str, float]:
-    forces, terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p)
+    forces, terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend)
 
     idx_a = idx_b = idx_h = None
     for idx, site in enumerate(sites):
@@ -286,10 +633,10 @@ def finite_difference_force_spot_checks(
             minus_sites[site_idx].position_angstrom[axis] -= delta
 
             _, terms_plus = compute_pbme_forces_and_hamiltonian(
-                plus_sites, n_solvent_molecules, diabatic_table, map_r, map_p
+                plus_sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
             )
             _, terms_minus = compute_pbme_forces_and_hamiltonian(
-                minus_sites, n_solvent_molecules, diabatic_table, map_r, map_p
+                minus_sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
             )
 
             fd_force = -(terms_plus["H_map"] - terms_minus["H_map"]) / (2.0 * delta)
@@ -607,7 +954,13 @@ def run_nve_md(
     h_matrix_log_path: Path,
     mapping_log_path: Path,
     observables_log_path: Path,
+    kernel_backend: str = "python",
 ) -> None:
+    if kernel_backend not in {"python", "numba"}:
+        raise ValueError("kernel_backend must be 'python' or 'numba'.")
+    if kernel_backend == "numba" and not NUMBA_AVAILABLE:
+        raise RuntimeError("Numba backend requested but numba is not installed.")
+
     diabatic_table = load_diabatic_tables(diabatic_path)
     r_min, r_max = diabatic_r_range(diabatic_table)
     print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
@@ -677,7 +1030,9 @@ def run_nve_md(
         )
 
     try:
-        forces, terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p)
+        forces, terms = compute_pbme_forces_and_hamiltonian(
+            sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+        )
     except (RuntimeError, ValueError) as exc:
         with energy_log_path.open("a", encoding="utf-8") as flog:
             flog.write(f"# terminated at step 0: {exc}\n")
@@ -685,7 +1040,9 @@ def run_nve_md(
 
     fd_summary = {"fd_count": 0.0, "fd_delta": fd_delta, "fd_max_abs_err": 0.0, "fd_max_rel_err": 0.0, "fd_mean_abs_err": 0.0}
     if validate_forces:
-        fd_summary = finite_difference_force_spot_checks(sites, n_solvent_molecules, diabatic_table, map_r, map_p, fd_delta)
+        fd_summary = finite_difference_force_spot_checks(
+            sites, n_solvent_molecules, diabatic_table, map_r, map_p, fd_delta, kernel_backend=kernel_backend
+        )
 
     for step in range(steps + 1):
         if step % write_frequency == 0:
@@ -717,7 +1074,9 @@ def run_nve_md(
         enforce_solvent_bond_constraints(sites, n_solvent_molecules, solvent_bond_distance)
 
         try:
-            new_forces, new_terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p)
+            new_forces, new_terms = compute_pbme_forces_and_hamiltonian(
+                sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+            )
         except (RuntimeError, ValueError) as exc:
             with energy_log_path.open("a", encoding="utf-8") as flog:
                 flog.write(f"# terminated at step {step + 1}: {exc}\n")

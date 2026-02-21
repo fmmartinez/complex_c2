@@ -1,0 +1,2 @@
+# Optional acceleration backend for PBME force kernel
+numba>=0.59

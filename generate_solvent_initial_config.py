@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Seed for mapping-variable sampling (defaults to --seed)",
     )
+    parser.add_argument(
+        "--kernel-backend",
+        choices=("python", "numba"),
+        default="python",
+        help="Force/Hamiltonian backend (numba requires numba installed)",
+    )
     return parser.parse_args()
 
 
@@ -95,6 +101,7 @@ def main() -> None:
         h_matrix_log_path=args.h_matrix_log,
         mapping_log_path=args.mapping_log,
         observables_log_path=args.observables_log,
+        kernel_backend=args.kernel_backend,
     )
 
     print(f"Initial temperature: {initial_temp:.3f} K")
@@ -111,6 +118,7 @@ def main() -> None:
     print(f"Effective Hamiltonian log written to: {args.h_matrix_log}")
     print(f"Mapping variables log written to: {args.mapping_log}")
     print(f"Observables log written to: {args.observables_log}")
+    print(f"Kernel backend: {args.kernel_backend}")
 
 
 if __name__ == "__main__":
