@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import List
 
@@ -58,6 +59,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--output-json", type=Path, default=Path("adiabatic_states.json"))
     parser.add_argument("--output-plot", type=Path, default=Path("adiabatic_eigenvalues.png"))
+    parser.add_argument(
+        "--density-plots-dir",
+        type=Path,
+        default=Path("adiabatic_state_density_plots"),
+        help="Directory for per-R_AB adiabatic |phi|^2 plots",
+    )
     return parser.parse_args()
 
 
@@ -215,6 +222,40 @@ def main() -> None:
     except ImportError as exc:
         raise RuntimeError("matplotlib is required to generate the eigenvalue plot. Install dependencies from requirements.txt") from exc
 
+    plots_dir = args.density_plots_dir
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    per_r_results = []
+    
+    for i_r, r_ab in enumerate(r_ab_values):
+        coeffs = np.asarray(all_coeffs[i_r], dtype=float)
+        psi_ad = coeffs.T @ basis
+        densities = psi_ad * psi_ad
+
+        r_tag = re.sub(r"[^0-9A-Za-z_.-]", "_", f"{r_ab:.4f}")
+        plot_path = plots_dir / f"adiabatic_state_densities_R_{r_tag}.png"
+
+        plt.figure(figsize=(7, 5))
+        for i_state in range(n_basis):
+            plt.plot(r_grid, densities[i_state], linewidth=1.0, label=f"state {i_state + 1}")
+        plt.xlabel(r"$r_{AH}$ ($\AA$)")
+        plt.ylabel(r"$|\phi|^2$")
+        plt.title(f"Adiabatic state densities at R_AB={r_ab:.4f} A")
+        plt.legend(fontsize=7, ncol=2)
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=180)
+        plt.close()
+
+        per_r_results.append(
+            {
+                "R": float(r_ab),
+                "eigenvalues": [float(v) for v in all_eigvals[i_r]],
+                "adiabatic_eigenstates_grid": psi_ad.tolist(),
+                "adiabatic_state_densities_grid": densities.tolist(),
+                "adiabatic_states_plot": str(plot_path),
+            }
+        )
+
     output = {
         "model": "AHB proton subsystem adiabatic states",
         "units": {"energy": "kcal/mol", "distance": "angstrom", "time": "fs", "mass": "amu"},
@@ -239,6 +280,7 @@ def main() -> None:
         "eigenvalues": all_eigvals,
         "coefficients": all_coeffs,
         "state_labels": [f"state_{i+1}" for i in range(n_basis)],
+        "results": per_r_results,
     }
 
     args.output_json.write_text(json.dumps(output, indent=2), encoding="utf-8")
@@ -257,6 +299,7 @@ def main() -> None:
 
     print(f"Wrote intermediate JSON: {args.output_json}")
     print(f"Wrote eigenvalue plot: {args.output_plot}")
+    print(f"Wrote adiabatic density plots to: {plots_dir}")
 
 
 if __name__ == "__main__":
