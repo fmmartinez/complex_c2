@@ -897,6 +897,40 @@ def generate_configuration(
 
 
 
+def apply_spherical_reflecting_wall(sites: List[Site], wall_radius_angstrom: float) -> None:
+    if wall_radius_angstrom <= 0.0:
+        return
+
+    for site in sites:
+        if site.site_type == "H":
+            continue
+
+        x, y, z = site.position_angstrom
+        r = math.sqrt(x * x + y * y + z * z)
+        if r <= wall_radius_angstrom:
+            continue
+
+        ux = x / max(r, 1e-12)
+        uy = y / max(r, 1e-12)
+        uz = z / max(r, 1e-12)
+
+        overshoot = r - wall_radius_angstrom
+        reflected_r = max(wall_radius_angstrom - overshoot, 0.0)
+        site.position_angstrom[0] = reflected_r * ux
+        site.position_angstrom[1] = reflected_r * uy
+        site.position_angstrom[2] = reflected_r * uz
+
+        vn = (
+            site.velocity_ang_fs[0] * ux
+            + site.velocity_ang_fs[1] * uy
+            + site.velocity_ang_fs[2] * uz
+        )
+        if vn > 0.0:
+            site.velocity_ang_fs[0] -= 2.0 * vn * ux
+            site.velocity_ang_fs[1] -= 2.0 * vn * uy
+            site.velocity_ang_fs[2] -= 2.0 * vn * uz
+
+
 
 def compute_observables(sites: List[Site], n_solvent_molecules: int) -> Tuple[float, float]:
     idx_a = idx_b = None
@@ -980,6 +1014,7 @@ def run_nve_md(
     mapping_log_path: Path,
     observables_log_path: Path,
     kernel_backend: str = "python",
+    wall_radius_angstrom: float = 9.0,
 ) -> None:
     if kernel_backend not in {"python", "numba"}:
         raise ValueError("kernel_backend must be 'python' or 'numba'.")
@@ -1099,6 +1134,7 @@ def run_nve_md(
             site.position_angstrom[2] += dt_fs * site.velocity_ang_fs[2]
 
         enforce_solvent_bond_constraints(sites, n_solvent_molecules, solvent_bond_distance)
+        apply_spherical_reflecting_wall(sites, wall_radius_angstrom)
 
         try:
             new_forces, new_terms = compute_pbme_forces_and_hamiltonian(

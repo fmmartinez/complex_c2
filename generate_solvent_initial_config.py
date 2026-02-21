@@ -18,6 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-molecules", type=int, default=7)
     parser.add_argument("--temperature", type=float, default=50.0, help="Kelvin")
     parser.add_argument("--radius", type=float, default=7.0, help="Angstrom")
+    parser.add_argument(
+        "--wall-offset",
+        type=float,
+        default=2.0,
+        help="Spherical wall offset added to --radius (Angstrom)",
+    )
     parser.add_argument("--bond-distance", type=float, default=1.7, help="Angstrom (solvent C1-C2)")
     parser.add_argument("--min-distance", type=float, default=3.0, help="Angstrom")
     parser.add_argument("--seed", type=int, default=20260218)
@@ -83,6 +89,7 @@ def main() -> None:
     if not 1 <= args.occupied_state <= 3:
         raise ValueError("--occupied-state must be 1, 2, or 3.")
     mapping_seed = args.seed if args.mapping_seed is None else args.mapping_seed
+    wall_radius = args.radius + args.wall_offset
 
     run_nve_md(
         sites=sites,
@@ -102,6 +109,7 @@ def main() -> None:
         mapping_log_path=args.mapping_log,
         observables_log_path=args.observables_log,
         kernel_backend=args.kernel_backend,
+        wall_radius_angstrom=wall_radius,
     )
 
     print(f"Initial temperature: {initial_temp:.3f} K")
@@ -119,6 +127,7 @@ def main() -> None:
     print(f"Mapping variables log written to: {args.mapping_log}")
     print(f"Observables log written to: {args.observables_log}")
     print(f"Kernel backend: {args.kernel_backend}")
+    print(f"Spherical wall radius: {wall_radius:.3f} A")
 
 
 if __name__ == "__main__":
