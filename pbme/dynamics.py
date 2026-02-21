@@ -105,7 +105,7 @@ def _get_lj_sigma_epsilon_numba(type_i: int, type_j: int) -> Tuple[float, float,
         epsilon_b = 0.238 if b == 0 else 0.415
         return 1.0, 0.5 * (sigma_a + sigma_b), math.sqrt(epsilon_a * epsilon_b)
 
-    if (a == 2 or a == 3) and (b == 0 or b == 1):
+    if (a == 0 or a == 1) and (b == 2 or b == 3):
         return 1.0, 3.5, 0.3974
 
     if a == 4 and (b == 0 or b == 1):
