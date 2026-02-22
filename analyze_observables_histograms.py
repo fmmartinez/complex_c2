@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Multiplier on Scott bandwidth (e.g., >1 smoother, <1 sharper).",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=4000,
+        help="Chunk size for memory-efficient KDE accumulation (default: 4000).",
+    )
     return parser.parse_args()
 
 
@@ -95,7 +101,7 @@ def _scott_bandwidth_1d(values: np.ndarray, scale: float) -> float:
     return scale * std * (n ** (-1.0 / 5.0))
 
 
-def _kde_1d(values: np.ndarray, grid_size: int, bw_scale: float) -> Tuple[np.ndarray, np.ndarray]:
+def _kde_1d(values: np.ndarray, grid_size: int, bw_scale: float, chunk_size: int) -> Tuple[np.ndarray, np.ndarray]:
     lo = float(values.min())
     hi = float(values.max())
     if hi <= lo:
@@ -105,9 +111,15 @@ def _kde_1d(values: np.ndarray, grid_size: int, bw_scale: float) -> Tuple[np.nda
     x = np.linspace(lo - pad, hi + pad, grid_size)
     h = max(_scott_bandwidth_1d(values, bw_scale), 1e-12)
 
-    z = (x[:, None] - values[None, :]) / h
-    kernel = np.exp(-0.5 * z * z)
-    density = kernel.mean(axis=1) / (h * np.sqrt(2.0 * np.pi))
+    accum = np.zeros_like(x)
+    n = values.size
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        vals = values[start:stop]
+        z = (x[:, None] - vals[None, :]) / h
+        accum += np.exp(-0.5 * z * z).sum(axis=1)
+
+    density = accum / (n * h * np.sqrt(2.0 * np.pi))
     return x, density
 
 
@@ -123,7 +135,13 @@ def _scott_bandwidth_2d(x: np.ndarray, y: np.ndarray, scale: float) -> Tuple[flo
     return max(factor * sx, 1e-12), max(factor * sy, 1e-12)
 
 
-def _kde_2d(x: np.ndarray, y: np.ndarray, grid_size: int, bw_scale: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _kde_2d(
+    x: np.ndarray,
+    y: np.ndarray,
+    grid_size: int,
+    bw_scale: float,
+    chunk_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     xmin, xmax = float(x.min()), float(x.max())
     ymin, ymax = float(y.min()), float(y.max())
     if xmax <= xmin:
@@ -135,13 +153,23 @@ def _kde_2d(x: np.ndarray, y: np.ndarray, grid_size: int, bw_scale: float) -> Tu
     ypad = 0.05 * (ymax - ymin)
     gx = np.linspace(xmin - xpad, xmax + xpad, grid_size)
     gy = np.linspace(ymin - ypad, ymax + ypad, grid_size)
-    xx, yy = np.meshgrid(gx, gy, indexing="xy")
 
     hx, hy = _scott_bandwidth_2d(x, y, bw_scale)
-    dx = (xx[..., None] - x[None, None, :]) / hx
-    dy = (yy[..., None] - y[None, None, :]) / hy
-    kernel = np.exp(-0.5 * (dx * dx + dy * dy))
-    density = kernel.mean(axis=2) / (2.0 * np.pi * hx * hy)
+    density = np.zeros((gy.size, gx.size), dtype=np.float64)
+
+    n = x.size
+    for start in range(0, n, chunk_size):
+        stop = min(start + chunk_size, n)
+        xc = x[start:stop]
+        yc = y[start:stop]
+
+        dx = (gx[:, None] - xc[None, :]) / hx
+        dy = (gy[:, None] - yc[None, :]) / hy
+        kx = np.exp(-0.5 * dx * dx)  # (nx, chunk)
+        ky = np.exp(-0.5 * dy * dy)  # (ny, chunk)
+        density += ky @ kx.T
+
+    density /= (n * 2.0 * np.pi * hx * hy)
     return gx, gy, density
 
 
@@ -170,7 +198,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1D KDE: solvent polarization
-    x_pol, d_pol = _kde_1d(pol_arr, args.grid_size, args.bandwidth_scale)
+    x_pol, d_pol = _kde_1d(pol_arr, args.grid_size, args.bandwidth_scale, args.chunk_size)
     plt.figure(figsize=(7, 4.8))
     plt.plot(x_pol, d_pol, lw=2.2, label="KDE")
     plt.fill_between(x_pol, d_pol, alpha=0.25)
@@ -184,7 +212,7 @@ def main() -> None:
     plt.close()
 
     # 1D KDE: COM distance
-    x_com, d_com = _kde_1d(com_arr, args.grid_size, args.bandwidth_scale)
+    x_com, d_com = _kde_1d(com_arr, args.grid_size, args.bandwidth_scale, args.chunk_size)
     plt.figure(figsize=(7, 4.8))
     plt.plot(x_com, d_com, lw=2.2, color="tab:orange", label="KDE")
     plt.fill_between(x_com, d_com, alpha=0.25, color="tab:orange")
@@ -198,7 +226,7 @@ def main() -> None:
     plt.close()
 
     # 2D joint KDE
-    gx, gy, dens = _kde_2d(com_arr, pol_arr, args.grid_size, args.bandwidth_scale)
+    gx, gy, dens = _kde_2d(com_arr, pol_arr, args.grid_size, args.bandwidth_scale, args.chunk_size)
     plt.figure(figsize=(7.2, 5.6))
     im = plt.pcolormesh(gx, gy, dens, shading="auto", cmap="viridis")
     plt.xlabel("COM distance")
@@ -229,6 +257,7 @@ def main() -> None:
 
     print(f"Discovered {len(files)} trajectory log files.")
     print(f"Aggregated {pol_arr.size} samples.")
+    print(f"KDE chunk size: {args.chunk_size}")
     print(f"Wrote: {out_pol}")
     print(f"Wrote: {out_com}")
     print(f"Wrote: {out_joint}")
