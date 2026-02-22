@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import List, Tuple
 
@@ -31,6 +32,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.01594,
         help="HBAR_MAPPING used for mapping population conversion (default: 0.01594).",
+    )
+    parser.add_argument(
+        "--diabatic-json",
+        type=Path,
+        default=Path("diabatic_matrices.json"),
+        help="Path to diabatic_matrices.json used to define R_AB bin extent.",
+    )
+    parser.add_argument(
+        "--rab-bins",
+        type=int,
+        default=10,
+        help="Number of R_AB bins for conditional histograms (default: 10).",
     )
     return parser.parse_args()
 
@@ -125,6 +138,32 @@ def _parse_mapping_populations(path: Path, n_states: int, hbar_mapping: float) -
 
     return pops, available_states
 
+
+def _load_rab_bounds_from_diabatic(path: Path) -> Tuple[float, float]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    results = obj.get("results", [])
+    if not results:
+        raise RuntimeError(f"No 'results' entries found in {path}.")
+    r_vals = [float(item["R"]) for item in results]
+    return float(min(r_vals)), float(max(r_vals))
+
+
+def _parse_rab_series(path: Path) -> List[float]:
+    rabs: List[float] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 3 or parts[0] == "step":
+            continue
+        try:
+            rab = float(parts[2])
+        except ValueError:
+            continue
+        if np.isfinite(rab):
+            rabs.append(rab)
+    return rabs
 
 def _scott_bandwidth_1d(values: np.ndarray, scale: float) -> float:
     n = max(values.size, 2)
@@ -223,12 +262,40 @@ def main() -> None:
     gaps_all: List[float] = []
     pops_all: List[List[float]] = [[] for _ in range(args.n_states)]
 
+    if args.rab_bins <= 0:
+        raise ValueError("--rab-bins must be >= 1.")
+    rab_min, rab_max = _load_rab_bounds_from_diabatic(args.diabatic_json)
+    rab_edges = np.linspace(rab_min, rab_max, args.rab_bins + 1)
+    pol_by_rab: List[List[float]] = [[] for _ in range(args.rab_bins)]
+    com_by_rab: List[List[float]] = [[] for _ in range(args.rab_bins)]
+
     for obs_path in obs_files:
         traj_dir = obs_path.parent
 
         pol, com = _parse_observables_file(obs_path)
         pol_all.extend(pol)
         com_all.extend(com)
+
+        h_path_for_rab = traj_dir / "pbme_effective_hamiltonian.log"
+        if h_path_for_rab.exists():
+            rabs = _parse_rab_series(h_path_for_rab)
+            n_pair = min(len(pol), len(com), len(rabs))
+            if n_pair < len(pol) or n_pair < len(rabs):
+                print(
+                    f"Warning: length mismatch in {traj_dir} (obs={len(pol)}, rab={len(rabs)}); using first {n_pair} samples for R_AB-binned histograms."
+                )
+            for i in range(n_pair):
+                rab = rabs[i]
+                if rab < rab_min or rab > rab_max:
+                    continue
+                bin_idx = int(np.searchsorted(rab_edges, rab, side='right') - 1)
+                if bin_idx == args.rab_bins:
+                    bin_idx = args.rab_bins - 1
+                if 0 <= bin_idx < args.rab_bins:
+                    pol_by_rab[bin_idx].append(pol[i])
+                    com_by_rab[bin_idx].append(com[i])
+        else:
+            print(f"Warning: missing {h_path_for_rab}; skipping R_AB-binned observables for this trajectory.")
 
         map_path = traj_dir / "pbme_mapping.log"
         if map_path.exists():
@@ -323,10 +390,46 @@ def main() -> None:
         )
         pop_outs.append(out)
 
+
+    rab_pol_outs: List[Path] = []
+    rab_com_outs: List[Path] = []
+    for b in range(args.rab_bins):
+        if not pol_by_rab[b] or not com_by_rab[b]:
+            print(
+                f"Warning: no samples in R_AB bin {b + 1}/{args.rab_bins} [{rab_edges[b]:.6f}, {rab_edges[b + 1]:.6f}); skipping."
+            )
+            continue
+        pol_bin_arr = np.asarray(pol_by_rab[b], dtype=np.float64)
+        com_bin_arr = np.asarray(com_by_rab[b], dtype=np.float64)
+
+        out_pol_bin = args.output_dir / f"solvent_polarization_kde_rab_bin_{b + 1:02d}.png"
+        _plot_1d_kde(
+            pol_bin_arr,
+            f"Solvent polarization KDE, R_AB bin {b + 1}/{args.rab_bins}\n"
+            f"[{rab_edges[b]:.4f}, {rab_edges[b + 1]:.4f}] (N={pol_bin_arr.size})",
+            "Solvent polarization (dE_pol)",
+            out_pol_bin,
+            args,
+        )
+        rab_pol_outs.append(out_pol_bin)
+
+        out_com_bin = args.output_dir / f"com_distance_kde_rab_bin_{b + 1:02d}.png"
+        _plot_1d_kde(
+            com_bin_arr,
+            f"COM distance KDE, R_AB bin {b + 1}/{args.rab_bins}\n"
+            f"[{rab_edges[b]:.4f}, {rab_edges[b + 1]:.4f}] (N={com_bin_arr.size})",
+            "COM distance",
+            out_com_bin,
+            args,
+            color="tab:orange",
+        )
+        rab_com_outs.append(out_com_bin)
+
     print(f"Discovered {len(obs_files)} trajectory observable log files.")
     print(f"Aggregated {pol_arr.size} observables samples.")
     print(f"KDE chunk size: {args.chunk_size}")
     print(f"Assumed n_states: {args.n_states}; hbar_mapping: {args.hbar_mapping}")
+    print(f"R_AB bins: {args.rab_bins} across [{rab_min:.6f}, {rab_max:.6f}] from {args.diabatic_json}")
     print(f"Wrote: {out_pol}")
     print(f"Wrote: {out_com}")
     print(f"Wrote: {out_joint}")
@@ -334,6 +437,10 @@ def main() -> None:
     if out_gap is not None:
         print(f"Wrote: {out_gap}")
     for out in pop_outs:
+        print(f"Wrote: {out}")
+    for out in rab_pol_outs:
+        print(f"Wrote: {out}")
+    for out in rab_com_outs:
         print(f"Wrote: {out}")
 
 
