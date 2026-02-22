@@ -259,6 +259,7 @@ def main() -> None:
 
     pol_all: List[float] = []
     com_all: List[float] = []
+    rab_all: List[float] = []
     gaps_all: List[float] = []
     pops_all: List[List[float]] = [[] for _ in range(args.n_states)]
 
@@ -279,6 +280,7 @@ def main() -> None:
         h_path_for_rab = traj_dir / "pbme_effective_hamiltonian.log"
         if h_path_for_rab.exists():
             rabs = _parse_rab_series(h_path_for_rab)
+            rab_all.extend(rabs)
             n_pair = min(len(pol), len(com), len(rabs))
             if n_pair < len(pol) or n_pair < len(rabs):
                 print(
@@ -326,6 +328,21 @@ def main() -> None:
 
     out_com = args.output_dir / "com_distance_kde.png"
     _plot_1d_kde(com_arr, f"Aggregated COM distance KDE\nN={com_arr.size} samples from {len(obs_files)} trajectories", "COM distance", out_com, args, color="tab:orange")
+
+    out_rab = None
+    if rab_all:
+        rab_arr = np.asarray(rab_all, dtype=np.float64)
+        out_rab = args.output_dir / "rab_kde.png"
+        _plot_1d_kde(
+            rab_arr,
+            f"Aggregated R_AB KDE\nN={rab_arr.size} samples from {len(obs_files)} trajectories",
+            "R_AB",
+            out_rab,
+            args,
+            color="tab:purple",
+        )
+    else:
+        print("Warning: no valid R_AB samples found in pbme_effective_hamiltonian.log files; skipping R_AB histogram.")
 
     gx, gy, dens = _kde_2d(com_arr, pol_arr, args.grid_size, args.bandwidth_scale, args.chunk_size)
     plt.figure(figsize=(7.2, 5.6))
@@ -434,6 +451,8 @@ def main() -> None:
     print(f"Wrote: {out_com}")
     print(f"Wrote: {out_joint}")
     print(f"Wrote: {out_joint_contour}")
+    if out_rab is not None:
+        print(f"Wrote: {out_rab}")
     if out_gap is not None:
         print(f"Wrote: {out_gap}")
     for out in pop_outs:
