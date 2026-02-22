@@ -1,0 +1,4 @@
+# Optional acceleration backend for PBME force kernel
+numpy>=1.26
+numba>=0.59
+matplotlib>=3.8
