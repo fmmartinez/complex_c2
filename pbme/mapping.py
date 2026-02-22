@@ -23,7 +23,7 @@ def sample_focused_mapping_variables(
         map_p.append(rng.gauss(0.0, std))
 
     for i in range(n_states):
-        target = 3.0 if i == occupied_state else 1.0
+        target = (3.0 * HBAR_MAPPING) if i == occupied_state else HBAR_MAPPING
         radius = math.sqrt(map_r[i] * map_r[i] + map_p[i] * map_p[i])
         if radius < 1e-14:
             map_r[i] = math.sqrt(target)
