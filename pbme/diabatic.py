@@ -83,7 +83,21 @@ def load_diabatic_tables(path: Path) -> Dict[str, object]:
     results = obj["results"]
     r_values = [float(item["R"]) for item in results]
 
-    n_states = int(results[0].get("n_eigen", len(results[0]["hamiltonian_reduced_diabatic"])))
+    h0 = results[0]["hamiltonian_reduced_diabatic"]
+    n_states = len(h0)
+    if n_states == 0:
+        raise ValueError("hamiltonian_reduced_diabatic is empty in diabatic JSON.")
+
+    for row in h0:
+        if len(row) != n_states:
+            raise ValueError("hamiltonian_reduced_diabatic must be square in diabatic JSON.")
+
+    for item in results:
+        h_mat = item["hamiltonian_reduced_diabatic"]
+        if len(h_mat) != n_states or any(len(row) != n_states for row in h_mat):
+            raise ValueError("All hamiltonian_reduced_diabatic matrices must share the same square shape.")
+        if len(item["r_diagonalized_eigenstates_grid"]) != n_states:
+            raise ValueError("Eigenstate count must match diabatic matrix dimension for each R sample.")
 
     h_splines: List[List[PchipInterpolator]] = [[None for _ in range(n_states)] for _ in range(n_states)]  # type: ignore
     for i in range(n_states):

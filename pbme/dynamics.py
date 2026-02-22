@@ -197,20 +197,22 @@ def _compute_forces_numba_core(
     weights[0] *= 0.5
     weights[-1] *= 0.5
 
-    s_map = np.zeros((3, 3), dtype=np.float64)
-    for i in range(3):
-        for j in range(3):
+    n_states = map_r.shape[0]
+
+    s_map = np.zeros((n_states, n_states), dtype=np.float64)
+    for i in range(n_states):
+        for j in range(n_states):
             s_map[i, j] = map_r[i] * map_r[j] + map_p[i] * map_p[j] - (HBAR_MAPPING if i == j else 0.0)
 
     omega = np.zeros(grid.shape[0], dtype=np.float64)
     for g in range(grid.shape[0]):
         tmp = 0.0
-        for i in range(3):
-            for j in range(3):
+        for i in range(n_states):
+            for j in range(n_states):
                 tmp += s_map[i, j] * eigenstates[i, g] * eigenstates[j, g]
         omega[g] = tmp / (2.0 * HBAR_MAPPING)
 
-    v_cs = np.zeros((3, 3), dtype=np.float64)
+    v_cs = np.zeros((n_states, n_states), dtype=np.float64)
     for g in range(grid.shape[0]):
         r_ah = grid[g]
         fpol, _ = _polarization_switch_numba(r_ah)
@@ -251,8 +253,8 @@ def _compute_forces_numba_core(
 
             v_gs = e_hs + e_as + e_bs
             wg = weights[g] * omega[g]
-            for i in range(3):
-                for j in range(3):
+            for i in range(n_states):
+                for j in range(n_states):
                     v_cs[i, j] += weights[g] * eigenstates[i, g] * eigenstates[j, g] * v_gs
 
             if abs(e_hs) > 0.0:
@@ -308,14 +310,14 @@ def _compute_forces_numba_core(
         k_total += 0.5 * masses[i] * (vx * vx + vy * vy + vz * vz)
     k_total *= AMU_ANG2_FS2_TO_KCAL_MOL
 
-    h_eff = np.zeros((3, 3), dtype=np.float64)
-    for i in range(3):
-        for j in range(3):
+    h_eff = np.zeros((n_states, n_states), dtype=np.float64)
+    for i in range(n_states):
+        for j in range(n_states):
             h_eff[i, j] = h_diab[i, j] + v_cs[i, j]
     e_h = 0.0
     dE_dR = 0.0
-    for i in range(3):
-        for j in range(3):
+    for i in range(n_states):
+        for j in range(n_states):
             e_h += h_eff[i, j] * s_map[i, j]
             dE_dR += dh_diab[i, j] * s_map[i, j]
     e_h /= 2.0 * HBAR_MAPPING
@@ -363,6 +365,11 @@ def compute_pbme_forces_and_hamiltonian(
     h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
     eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
     grid = diabatic_table["grid"]
+    n_states = int(diabatic_table.get("n_states", len(h_diab)))
+    if len(map_r) != n_states or len(map_p) != n_states:
+        raise RuntimeError(
+            f"Mapping variable dimension mismatch: len(map_r)={len(map_r)}, len(map_p)={len(map_p)}, n_states={n_states}."
+        )
 
     if kernel_backend == "numba":
         if not NUMBA_AVAILABLE:
@@ -472,17 +479,17 @@ def compute_pbme_forces_and_hamiltonian(
     weights[0] *= 0.5
     weights[-1] *= 0.5
 
-    s_map = [[map_r[i] * map_r[j] + map_p[i] * map_p[j] - (HBAR_MAPPING if i == j else 0.0) for j in range(3)] for i in range(3)]
+    s_map = [[map_r[i] * map_r[j] + map_p[i] * map_p[j] - (HBAR_MAPPING if i == j else 0.0) for j in range(n_states)] for i in range(n_states)]
 
     omega = [0.0 for _ in range(ngrid)]
     for g in range(ngrid):
         tmp = 0.0
-        for i in range(3):
-            for j in range(3):
+        for i in range(n_states):
+            for j in range(n_states):
                 tmp += s_map[i][j] * eigenstates[i][g] * eigenstates[j][g]
         omega[g] = tmp / (2.0 * HBAR_MAPPING)
 
-    v_cs = [[0.0] * 3 for _ in range(3)]
+    v_cs = [[0.0] * n_states for _ in range(n_states)]
     for g, r_ah in enumerate(grid):
         fpol, _ = polarization_switch(r_ah)
         q_a = (1.0 - fpol) * POLARIZATION["Q_A_cov"] + fpol * POLARIZATION["Q_A_ion"]
@@ -490,7 +497,7 @@ def compute_pbme_forces_and_hamiltonian(
         q_b = (1.0 - fpol) * POLARIZATION["Q_B_cov"] + fpol * POLARIZATION["Q_B_ion"]
 
         rh = [ra[k] + uab[k] * r_ah for k in range(3)]
-        projector = [[eigenstates[i][g] * eigenstates[j][g] for j in range(3)] for i in range(3)]
+        projector = [[eigenstates[i][g] * eigenstates[j][g] for j in range(n_states)] for i in range(n_states)]
 
         for s_idx in range(2 * n_solvent_molecules):
             ss = sites[s_idx]
@@ -522,8 +529,8 @@ def compute_pbme_forces_and_hamiltonian(
 
             v_gs = e_hs + e_as + e_bs
             wg = weights[g] * omega[g]
-            for i in range(3):
-                for j in range(3):
+            for i in range(n_states):
+                for j in range(n_states):
                     v_cs[i][j] += weights[g] * projector[i][j] * v_gs
 
             if abs(e_hs) > 0.0:
@@ -560,12 +567,12 @@ def compute_pbme_forces_and_hamiltonian(
 
     k_total = kinetic_energy_kcal_mol(sites, exclude_h=True)
 
-    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(3)] for i in range(3)]
+    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(n_states)] for i in range(n_states)]
 
     e_h = 0.0
     dE_dR = 0.0
-    for i in range(3):
-        for j in range(3):
+    for i in range(n_states):
+        for j in range(n_states):
             e_h += h_eff[i][j] * s_map[i][j]
             dE_dR += dh_diab[i][j] * s_map[i][j]
     e_h /= (2.0 * HBAR_MAPPING)
@@ -1011,9 +1018,12 @@ def run_nve_md(
         raise RuntimeError("Numba backend requested but numpy is not installed.")
     diabatic_table = load_diabatic_tables(diabatic_path)
     r_min, r_max = diabatic_r_range(diabatic_table)
+    n_states = int(diabatic_table.get("n_states", 3))
+    if not (0 <= occupied_state < n_states):
+        raise ValueError(f"occupied_state must be in [0, {n_states - 1}], got {occupied_state}.")
     print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
     mapping_rng = random.Random(mapping_seed)
-    map_r, map_p = sample_focused_mapping_variables(3, occupied_state, mapping_rng)
+    map_r, map_p = sample_focused_mapping_variables(n_states, occupied_state, mapping_rng)
 
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text(
@@ -1021,12 +1031,14 @@ def run_nve_md(
         "fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err\n",
         encoding="utf-8",
     )
+    h_labels = [f"h{i + 1}{j + 1}" for i in range(n_states) for j in range(n_states)]
     h_matrix_log_path.write_text(
-        "step time_fs R_AB h11 h12 h13 h21 h22 h23 h31 h32 h33\n",
+        "step time_fs R_AB " + " ".join(h_labels) + "\n",
         encoding="utf-8",
     )
+    mapping_labels = [f"M{i + 1}" for i in range(n_states)] + [item for i in range(n_states) for item in (f"R{i + 1}", f"P{i + 1}")]
     mapping_log_path.write_text(
-        "step time_fs M1 M2 M3 R1 P1 R2 P2 R3 P3\n",
+        "step time_fs " + " ".join(mapping_labels) + "\n",
         encoding="utf-8",
     )
     observables_log_path.write_text(
@@ -1035,7 +1047,7 @@ def run_nve_md(
     )
 
     def append_logs(step: int, terms: Dict[str, object], fd_summary: Dict[str, float], forces: List[List[float]]) -> None:
-        m_norms = [map_r[i] * map_r[i] + map_p[i] * map_p[i] for i in range(3)]
+        m_norms = [map_r[i] * map_r[i] + map_p[i] * map_p[i] for i in range(n_states)]
         with energy_log_path.open("a", encoding="utf-8") as flog:
             flog.write(
                 f"{step} {step * dt_fs:.6f} {float(terms['R_AB']):.8f} {float(terms['K']):.10f} {float(terms['V_SS']):.10f} "
@@ -1045,19 +1057,16 @@ def run_nve_md(
             )
 
         with mapping_log_path.open("a", encoding="utf-8") as fm:
-            fm.write(
-                f"{step} {step * dt_fs:.6f} {m_norms[0]:.10f} {m_norms[1]:.10f} {m_norms[2]:.10f} "
-                f"{map_r[0]:.10f} {map_p[0]:.10f} {map_r[1]:.10f} {map_p[1]:.10f} {map_r[2]:.10f} {map_p[2]:.10f}\n"
+            norm_str = " ".join(f"{value:.10f}" for value in m_norms)
+            rp_str = " ".join(
+                f"{value:.10f}" for pair in zip(map_r, map_p) for value in pair
             )
+            fm.write(f"{step} {step * dt_fs:.6f} {norm_str} {rp_str}\n")
 
         with h_matrix_log_path.open("a", encoding="utf-8") as fh:
             h_eff = terms["h_eff"]
-            fh.write(
-                f"{step} {step * dt_fs:.6f} {float(terms['R_AB']):.8f} "
-                f"{h_eff[0][0]:.10f} {h_eff[0][1]:.10f} {h_eff[0][2]:.10f} "
-                f"{h_eff[1][0]:.10f} {h_eff[1][1]:.10f} {h_eff[1][2]:.10f} "
-                f"{h_eff[2][0]:.10f} {h_eff[2][1]:.10f} {h_eff[2][2]:.10f}\n"
-            )
+            h_flat = " ".join(f"{h_eff[i][j]:.10f}" for i in range(n_states) for j in range(n_states))
+            fh.write(f"{step} {step * dt_fs:.6f} {float(terms['R_AB']):.8f} {h_flat}\n")
 
         dE_pol, r_com = compute_observables(sites, n_solvent_molecules)
         with observables_log_path.open("a", encoding="utf-8") as fo:
@@ -1072,7 +1081,7 @@ def run_nve_md(
                 f"step={step} time_fs={step * dt_fs:.3f} "
                 f"R_AB={float(terms['R_AB']):.6f} H_map={float(terms['H_map']):.6f} "
                 f"K={float(terms['K']):.6f} V_SS={float(terms['V_SS']):.6f} E_map={float(terms['E_map_coupling']):.6f} "
-                f"M=({m_norms[0]:.3f},{m_norms[1]:.3f},{m_norms[2]:.3f}) T_noH={temperature:.3f} max|F|={max_force:.6f} "
+                f"M=({','.join(f'{m:.3f}' for m in m_norms)}) T_noH={temperature:.3f} max|F|={max_force:.6f} "
                 f"occ={occupied_state + 1} FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
             ),
         )

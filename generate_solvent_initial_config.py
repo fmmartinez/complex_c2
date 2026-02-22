@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from pbme.diabatic import load_diabatic_tables
 from pbme.dynamics import generate_configuration, run_nve_md
 from pbme.io_utils import write_initial_xyz
 from pbme.model import instantaneous_temperature
@@ -86,8 +87,10 @@ def main() -> None:
         ),
     )
 
-    if not 1 <= args.occupied_state <= 3:
-        raise ValueError("--occupied-state must be 1, 2, or 3.")
+    diabatic_table = load_diabatic_tables(args.diabatic_json)
+    n_states = int(diabatic_table.get("n_states", 3))
+    if not 1 <= args.occupied_state <= n_states:
+        raise ValueError(f"--occupied-state must be in [1, {n_states}] for the supplied diabatic table.")
     mapping_seed = args.seed if args.mapping_seed is None else args.mapping_seed
     wall_radius = args.radius + args.wall_offset
 

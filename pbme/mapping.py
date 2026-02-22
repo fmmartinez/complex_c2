@@ -37,12 +37,13 @@ def sample_focused_mapping_variables(
 
 
 def compute_mapping_derivatives(h_eff: List[List[float]], map_r: List[float], map_p: List[float]) -> Tuple[List[float], List[float]]:
-    dr_dt = [0.0, 0.0, 0.0]
-    dp_dt = [0.0, 0.0, 0.0]
-    for i in range(3):
+    n_states = len(map_r)
+    dr_dt = [0.0 for _ in range(n_states)]
+    dp_dt = [0.0 for _ in range(n_states)]
+    for i in range(n_states):
         val_r = 0.0
         val_p = 0.0
-        for j in range(3):
+        for j in range(n_states):
             val_r += h_eff[i][j] * map_p[j]
             val_p += h_eff[i][j] * map_r[j]
         dr_dt[i] = val_r / HBAR_MAPPING
@@ -50,21 +51,35 @@ def compute_mapping_derivatives(h_eff: List[List[float]], map_r: List[float], ma
     return dr_dt, dp_dt
 
 
-def _symmetrize_3x3(h: List[List[float]]) -> List[List[float]]:
-    return [
-        [h[0][0], 0.5 * (h[0][1] + h[1][0]), 0.5 * (h[0][2] + h[2][0])],
-        [0.5 * (h[1][0] + h[0][1]), h[1][1], 0.5 * (h[1][2] + h[2][1])],
-        [0.5 * (h[2][0] + h[0][2]), 0.5 * (h[2][1] + h[1][2]), h[2][2]],
-    ]
+def _symmetrize_matrix(h: List[List[float]]) -> List[List[float]]:
+    n = len(h)
+    out = [[0.0 for _ in range(n)] for _ in range(n)]
+    for i in range(n):
+        out[i][i] = h[i][i]
+        for j in range(i + 1, n):
+            val = 0.5 * (h[i][j] + h[j][i])
+            out[i][j] = val
+            out[j][i] = val
+    return out
 
 
-def _jacobi_eigh_3x3(h: List[List[float]], max_iter: int = 50, tol: float = 1e-14) -> Tuple[List[float], List[List[float]]]:
+def _jacobi_eigh(h: List[List[float]], max_iter: int = 200, tol: float = 1e-14) -> Tuple[List[float], List[List[float]]]:
+    n = len(h)
     a = [row[:] for row in h]
-    v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    v = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
 
     for _ in range(max_iter):
-        pairs = [(0, 1, abs(a[0][1])), (0, 2, abs(a[0][2])), (1, 2, abs(a[1][2]))]
-        p, q, off = max(pairs, key=lambda x: x[2])
+        p = 0
+        q = 1 if n > 1 else 0
+        off = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                aij = abs(a[i][j])
+                if aij > off:
+                    off = aij
+                    p = i
+                    q = j
+
         if off < tol:
             break
 
@@ -75,7 +90,7 @@ def _jacobi_eigh_3x3(h: List[List[float]], max_iter: int = 50, tol: float = 1e-1
         c = math.cos(phi)
         s = math.sin(phi)
 
-        for k in range(3):
+        for k in range(n):
             if k == p or k == q:
                 continue
             akp = a[k][p]
@@ -90,32 +105,33 @@ def _jacobi_eigh_3x3(h: List[List[float]], max_iter: int = 50, tol: float = 1e-1
         a[p][q] = 0.0
         a[q][p] = 0.0
 
-        for k in range(3):
+        for k in range(n):
             vkp = v[k][p]
             vkq = v[k][q]
             v[k][p] = c * vkp - s * vkq
             v[k][q] = s * vkp + c * vkq
 
-    evals = [a[0][0], a[1][1], a[2][2]]
+    evals = [a[i][i] for i in range(n)]
     return evals, v
 
 
 def propagate_mapping_exact_half_step(map_r: List[float], map_p: List[float], h_eff: List[List[float]], dt_half_fs: float) -> None:
-    hsym = _symmetrize_3x3(h_eff)
-    evals, evecs = _jacobi_eigh_3x3(hsym)
+    n_states = len(map_r)
+    hsym = _symmetrize_matrix(h_eff)
+    evals, evecs = _jacobi_eigh(hsym)
 
-    r_mode = [sum(evecs[row][col] * map_r[row] for row in range(3)) for col in range(3)]
-    p_mode = [sum(evecs[row][col] * map_p[row] for row in range(3)) for col in range(3)]
+    r_mode = [sum(evecs[row][col] * map_r[row] for row in range(n_states)) for col in range(n_states)]
+    p_mode = [sum(evecs[row][col] * map_p[row] for row in range(n_states)) for col in range(n_states)]
 
-    r_rot = [0.0, 0.0, 0.0]
-    p_rot = [0.0, 0.0, 0.0]
-    for i in range(3):
+    r_rot = [0.0 for _ in range(n_states)]
+    p_rot = [0.0 for _ in range(n_states)]
+    for i in range(n_states):
         theta = evals[i] * dt_half_fs / HBAR_MAPPING
         c = math.cos(theta)
         s = math.sin(theta)
         r_rot[i] = c * r_mode[i] + s * p_mode[i]
         p_rot[i] = c * p_mode[i] - s * r_mode[i]
 
-    for row in range(3):
-        map_r[row] = sum(evecs[row][col] * r_rot[col] for col in range(3))
-        map_p[row] = sum(evecs[row][col] * p_rot[col] for col in range(3))
+    for row in range(n_states):
+        map_r[row] = sum(evecs[row][col] * r_rot[col] for col in range(n_states))
+        map_p[row] = sum(evecs[row][col] * p_rot[col] for col in range(n_states))
