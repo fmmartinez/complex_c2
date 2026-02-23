@@ -359,11 +359,10 @@ def compute_pbme_forces_and_hamiltonian(
     dab = [rb[k] - ra[k] for k in range(3)]
     r_ab = norm(dab)
     r_min, r_max = diabatic_r_range(diabatic_table)
-    if r_ab < r_min or r_ab > r_max:
-        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
+    r_ab_eval = min(max(r_ab, r_min), r_max)
 
-    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
-    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
+    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab_eval)
+    eigenstates = interpolate_eigenstates(diabatic_table, r_ab_eval)
     grid = diabatic_table["grid"]
     n_states = int(diabatic_table.get("n_states", len(h_diab)))
     if len(map_r) != n_states or len(map_p) != n_states:
@@ -402,6 +401,7 @@ def compute_pbme_forces_and_hamiltonian(
             "E_map_coupling": e_h,
             "H_map": h_map,
             "R_AB": r_ab,
+            "R_AB_eval": r_ab_eval,
             "dE_dRAB": dE_dR,
             "h_eff": h_eff.tolist(),
         }
@@ -424,12 +424,11 @@ def compute_pbme_forces_and_hamiltonian(
     dab = [rb[k] - ra[k] for k in range(3)]
     r_ab = norm(dab)
     r_min, r_max = diabatic_r_range(diabatic_table)
-    if r_ab < r_min or r_ab > r_max:
-        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
+    r_ab_eval = min(max(r_ab, r_min), r_max)
     uab = [dab[k] / max(r_ab, 1e-12) for k in range(3)]
 
-    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
-    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
+    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab_eval)
+    eigenstates = interpolate_eigenstates(diabatic_table, r_ab_eval)
     grid = diabatic_table["grid"]
 
     v_ss = 0.0
@@ -591,6 +590,7 @@ def compute_pbme_forces_and_hamiltonian(
         "E_map_coupling": e_h,
         "H_map": h_map,
         "R_AB": r_ab,
+        "R_AB_eval": r_ab_eval,
         "dE_dRAB": dE_dR,
         "h_eff": h_eff,
     }
@@ -1008,6 +1008,8 @@ def run_nve_md(
     h_matrix_log_path: Path,
     mapping_log_path: Path,
     observables_log_path: Path,
+    target_temperature_k: float,
+    equilibration_ps: float = 1.0,
     kernel_backend: str = "python",
     wall_radius_angstrom: float = 9.0,
  ) -> None:
@@ -1101,40 +1103,31 @@ def run_nve_md(
             ),
         )
 
-    try:
-        forces, terms = compute_pbme_forces_and_hamiltonian(
-            sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
-        )
-    except (RuntimeError, ValueError) as exc:
-        with energy_log_path.open("a", encoding="utf-8") as flog:
-            flog.write(f"# terminated at step 0: {exc}\n")
-        return
+    def _rescale_nuclear_velocities_to_temperature() -> None:
+        current_t = instantaneous_temperature([s for s in sites if s.site_type != "H"], remove_momentum_dof=False)
+        if current_t <= 1e-12:
+            return
+        scale = math.sqrt(target_temperature_k / current_t)
+        for site in sites:
+            if site.site_type == "H":
+                continue
+            site.velocity_ang_fs[0] *= scale
+            site.velocity_ang_fs[1] *= scale
+            site.velocity_ang_fs[2] *= scale
 
-    fd_summary = {"fd_count": 0.0, "fd_delta": fd_delta, "fd_max_abs_err": 0.0, "fd_max_rel_err": 0.0, "fd_mean_abs_err": 0.0}
-    if validate_forces:
-        fd_summary = finite_difference_force_spot_checks(
-            sites, n_solvent_molecules, diabatic_table, map_r, map_p, fd_delta, kernel_backend=kernel_backend
-        )
-
-    for step in range(steps + 1):
-        if step % write_frequency == 0:
-            append_logs(step, terms, fd_summary, forces)
-
-        if step == steps:
-            break
-
+    def _advance_one_step(curr_forces: List[List[float]], curr_terms: Dict[str, object], step_idx: int, log_failures: bool) -> Tuple[bool, List[List[float]], Dict[str, object]]:
         for idx, site in enumerate(sites):
             if site.site_type == "H":
                 continue
             inv_mass = 1.0 / site.mass_amu
-            ax = forces[idx][0] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
-            ay = forces[idx][1] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
-            az = forces[idx][2] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            ax = curr_forces[idx][0] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            ay = curr_forces[idx][1] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
+            az = curr_forces[idx][2] * KCAL_MOL_ANG_TO_AMU_ANG_FS2 * inv_mass
             site.velocity_ang_fs[0] += 0.5 * dt_fs * ax
             site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
-        propagate_mapping_exact_half_step(map_r, map_p, terms["h_eff"], 0.5 * dt_fs)
+        propagate_mapping_exact_half_step(map_r, map_p, curr_terms["h_eff"], 0.5 * dt_fs)
 
         for site in sites:
             if site.site_type == "H":
@@ -1151,9 +1144,10 @@ def run_nve_md(
                 sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
             )
         except (RuntimeError, ValueError) as exc:
-            with energy_log_path.open("a", encoding="utf-8") as flog:
-                flog.write(f"# terminated at step {step + 1}: {exc}\n")
-            break
+            if log_failures:
+                with energy_log_path.open("a", encoding="utf-8") as flog:
+                    flog.write(f"# terminated at step {step_idx + 1}: {exc}\n")
+            return False, curr_forces, curr_terms
 
         propagate_mapping_exact_half_step(map_r, map_p, new_terms["h_eff"], 0.5 * dt_fs)
 
@@ -1170,9 +1164,49 @@ def run_nve_md(
 
         enforce_solvent_velocity_constraints(sites, n_solvent_molecules)
 
-        if (step + 1) % 5000 == 0:
+        if (step_idx + 1) % 5000 == 0:
             remove_net_linear_momentum(sites)
 
-        terms = new_terms
-        forces = new_forces
+        return True, new_forces, new_terms
+
+    try:
+        forces, terms = compute_pbme_forces_and_hamiltonian(
+            sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+        )
+    except (RuntimeError, ValueError) as exc:
+        with energy_log_path.open("a", encoding="utf-8") as flog:
+            flog.write(f"# terminated at step 0: {exc}\n")
+        return
+
+    equil_steps = max(0, int(round((equilibration_ps * 1000.0) / dt_fs)))
+    rescale_interval_steps = max(1, int(round(100.0 / dt_fs)))
+    if equil_steps > 0:
+        print(
+            f"Equilibration phase: {equilibration_ps:.3f} ps ({equil_steps} steps) with velocity rescaling every 100 fs ({rescale_interval_steps} steps)."
+        )
+        for eq_step in range(equil_steps):
+            ok, forces, terms = _advance_one_step(forces, terms, eq_step, log_failures=False)
+            if not ok:
+                print(f"Warning: equilibration terminated early at step {eq_step + 1} due to force evaluation failure.")
+                break
+            if (eq_step + 1) % rescale_interval_steps == 0:
+                _rescale_nuclear_velocities_to_temperature()
+
+    fd_summary = {"fd_count": 0.0, "fd_delta": fd_delta, "fd_max_abs_err": 0.0, "fd_max_rel_err": 0.0, "fd_mean_abs_err": 0.0}
+    if validate_forces:
+        fd_summary = finite_difference_force_spot_checks(
+            sites, n_solvent_molecules, diabatic_table, map_r, map_p, fd_delta, kernel_backend=kernel_backend
+        )
+
+    for step in range(steps + 1):
+        if step % write_frequency == 0:
+            append_logs(step, terms, fd_summary, forces)
+
+        if step == steps:
+            break
+
+        ok, forces, terms = _advance_one_step(forces, terms, step, log_failures=True)
+        if not ok:
+            break
+
         fd_summary = {"fd_count": 0.0, "fd_delta": fd_delta, "fd_max_abs_err": 0.0, "fd_max_rel_err": 0.0, "fd_mean_abs_err": 0.0}

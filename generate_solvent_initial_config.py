@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--dt-fs", type=float, default=0.1)
+    parser.add_argument("--equilibration-ps", type=float, default=1.0, help="Equilibration duration in ps before production NVE.")
     parser.add_argument("--write-frequency", type=int, default=10)
 
     parser.add_argument("--initial-output", type=Path, default=Path("pbme_initial.xyz"))
@@ -118,12 +119,15 @@ def main() -> None:
         h_matrix_log_path=args.h_matrix_log,
         mapping_log_path=args.mapping_log,
         observables_log_path=args.observables_log,
+        target_temperature_k=args.temperature,
+        equilibration_ps=args.equilibration_ps,
         kernel_backend=args.kernel_backend,
         wall_radius_angstrom=wall_radius,
     )
 
     print(f"Initial temperature: {initial_temp:.3f} K")
     print(f"PBME dynamics run complete (steps={args.steps}, dt_fs={args.dt_fs}).")
+    print(f"Equilibration stage: {args.equilibration_ps:.3f} ps (velocity rescaling every 100 fs), then production NVE.")
     if args.validate_forces:
         print(f"Finite-difference force checks enabled (delta={args.fd_delta:.2e} A).")
     if args.mapping_init_mode == "focused":
