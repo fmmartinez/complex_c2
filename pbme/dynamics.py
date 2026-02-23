@@ -63,6 +63,24 @@ L_POL = POLARIZATION["l"]
 AMU_ANG2_FS2_TO_KCAL_MOL = 2390.05736055072
 
 
+def _edge_taper_weight(r_ab: float, r_min: float, r_max: float, taper_width: float) -> float:
+    if taper_width <= 0.0:
+        return 1.0
+    span = r_max - r_min
+    if span <= 0.0:
+        return 1.0
+    delta = min(taper_width, 0.49 * span)
+    d_left = r_ab - r_min
+    d_right = r_max - r_ab
+    d = d_left if d_left < d_right else d_right
+    if d <= 0.0:
+        return 0.0
+    if d >= delta:
+        return 1.0
+    x = d / delta
+    return 0.5 * (1.0 - math.cos(math.pi * x))
+
+
 @njit(cache=True)
 def _lj_energy_dudr_numba(r: float, sigma: float, epsilon: float) -> Tuple[float, float]:
     inv_r = 1.0 / max(r, 1e-12)
@@ -339,6 +357,7 @@ def compute_pbme_forces_and_hamiltonian(
     map_r: List[float],
     map_p: List[float],
     kernel_backend: str = "python",
+    edge_taper_width_angstrom: float = 0.02,
 ) -> Tuple[List[List[float]], Dict[str, object]]:
     if kernel_backend not in {"python", "numba"}:
         raise ValueError("kernel_backend must be 'python' or 'numba'.")
@@ -366,6 +385,8 @@ def compute_pbme_forces_and_hamiltonian(
     eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
     grid = diabatic_table["grid"]
     n_states = int(diabatic_table.get("n_states", len(h_diab)))
+    w_taper = _edge_taper_weight(r_ab, r_min, r_max, edge_taper_width_angstrom)
+    dh_diab_eff = [[w_taper * dh_diab[i][j] for j in range(n_states)] for i in range(n_states)]
     if len(map_r) != n_states or len(map_p) != n_states:
         raise RuntimeError(
             f"Mapping variable dimension mismatch: len(map_r)={len(map_r)}, len(map_p)={len(map_p)}, n_states={n_states}."
@@ -392,7 +413,7 @@ def compute_pbme_forces_and_hamiltonian(
             grid=np.asarray(grid, dtype=np.float64),
             eigenstates=np.asarray(eigenstates, dtype=np.float64),
             h_diab=np.asarray(h_diab, dtype=np.float64),
-            dh_diab=np.asarray(dh_diab, dtype=np.float64),
+            dh_diab=np.asarray(dh_diab_eff, dtype=np.float64),
             map_r=np.asarray(map_r, dtype=np.float64),
             map_p=np.asarray(map_p, dtype=np.float64),
         )
@@ -402,6 +423,7 @@ def compute_pbme_forces_and_hamiltonian(
             "E_map_coupling": e_h,
             "H_map": h_map,
             "R_AB": r_ab,
+            "w_RAB_taper": w_taper,
             "dE_dRAB": dE_dR,
             "h_eff": h_eff.tolist(),
         }
@@ -574,7 +596,7 @@ def compute_pbme_forces_and_hamiltonian(
     for i in range(n_states):
         for j in range(n_states):
             e_h += h_eff[i][j] * s_map[i][j]
-            dE_dR += dh_diab[i][j] * s_map[i][j]
+            dE_dR += dh_diab_eff[i][j] * s_map[i][j]
     e_h /= (2.0 * HBAR_MAPPING)
     dE_dR /= (2.0 * HBAR_MAPPING)
 
@@ -591,6 +613,7 @@ def compute_pbme_forces_and_hamiltonian(
         "E_map_coupling": e_h,
         "H_map": h_map,
         "R_AB": r_ab,
+        "w_RAB_taper": w_taper,
         "dE_dRAB": dE_dR,
         "h_eff": h_eff,
     }
@@ -618,8 +641,17 @@ def finite_difference_force_spot_checks(
     map_p: List[float],
     delta: float,
     kernel_backend: str = "python",
+    edge_taper_width_angstrom: float = 0.02,
 ) -> Dict[str, float]:
-    forces, terms = compute_pbme_forces_and_hamiltonian(sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend)
+    forces, terms = compute_pbme_forces_and_hamiltonian(
+        sites,
+        n_solvent_molecules,
+        diabatic_table,
+        map_r,
+        map_p,
+        kernel_backend=kernel_backend,
+        edge_taper_width_angstrom=edge_taper_width_angstrom,
+    )
 
     idx_a = idx_b = idx_h = None
     for idx, site in enumerate(sites):
@@ -652,10 +684,12 @@ def finite_difference_force_spot_checks(
             minus_sites[site_idx].position_angstrom[axis] -= delta
 
             _, terms_plus = compute_pbme_forces_and_hamiltonian(
-                plus_sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+                plus_sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend,
+                edge_taper_width_angstrom=edge_taper_width_angstrom
             )
             _, terms_minus = compute_pbme_forces_and_hamiltonian(
-                minus_sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+                minus_sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend,
+                edge_taper_width_angstrom=edge_taper_width_angstrom
             )
 
             fd_force = -(terms_plus["H_map"] - terms_minus["H_map"]) / (2.0 * delta)
@@ -1010,6 +1044,7 @@ def run_nve_md(
     observables_log_path: Path,
     target_temperature_k: float,
     equilibration_ps: float = 1.0,
+    edge_taper_width_angstrom: float = 0.02,
     kernel_backend: str = "python",
     wall_radius_angstrom: float = 9.0,
  ) -> None:
@@ -1045,7 +1080,7 @@ def run_nve_md(
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text(
         "step time_fs R_AB K_kcal_mol V_SS_kcal_mol E_map_coupling_kcal_mol H_map_kcal_mol dE_dRAB_kcal_mol_A "
-        "fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err\n",
+        "fd_count fd_delta_A fd_max_abs_err fd_max_rel_err fd_mean_abs_err w_RAB_taper\n",
         encoding="utf-8",
     )
     h_labels = [f"h{i + 1}{j + 1}" for i in range(n_states) for j in range(n_states)]
@@ -1070,7 +1105,7 @@ def run_nve_md(
                 f"{step} {step * dt_fs:.6f} {float(terms['R_AB']):.8f} {float(terms['K']):.10f} {float(terms['V_SS']):.10f} "
                 f"{float(terms['E_map_coupling']):.10f} {float(terms['H_map']):.10f} {float(terms['dE_dRAB']):.10f} "
                 f"{fd_summary['fd_count']:.0f} {fd_summary['fd_delta']:.6f} {fd_summary['fd_max_abs_err']:.10e} "
-                f"{fd_summary['fd_max_rel_err']:.10e} {fd_summary['fd_mean_abs_err']:.10e}\n"
+                f"{fd_summary['fd_max_rel_err']:.10e} {fd_summary['fd_mean_abs_err']:.10e} {float(terms['w_RAB_taper']):.10f}\n"
             )
 
         with mapping_log_path.open("a", encoding="utf-8") as fm:
@@ -1141,7 +1176,8 @@ def run_nve_md(
 
         try:
             new_forces, new_terms = compute_pbme_forces_and_hamiltonian(
-                sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+                sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend,
+                edge_taper_width_angstrom=edge_taper_width_angstrom
             )
         except (RuntimeError, ValueError) as exc:
             if log_failures:
@@ -1171,7 +1207,8 @@ def run_nve_md(
 
     try:
         forces, terms = compute_pbme_forces_and_hamiltonian(
-            sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend
+            sites, n_solvent_molecules, diabatic_table, map_r, map_p, kernel_backend=kernel_backend,
+            edge_taper_width_angstrom=edge_taper_width_angstrom
         )
     except (RuntimeError, ValueError) as exc:
         with energy_log_path.open("a", encoding="utf-8") as flog:
@@ -1195,7 +1232,8 @@ def run_nve_md(
     fd_summary = {"fd_count": 0.0, "fd_delta": fd_delta, "fd_max_abs_err": 0.0, "fd_max_rel_err": 0.0, "fd_mean_abs_err": 0.0}
     if validate_forces:
         fd_summary = finite_difference_force_spot_checks(
-            sites, n_solvent_molecules, diabatic_table, map_r, map_p, fd_delta, kernel_backend=kernel_backend
+            sites, n_solvent_molecules, diabatic_table, map_r, map_p, fd_delta, kernel_backend=kernel_backend,
+            edge_taper_width_angstrom=edge_taper_width_angstrom
         )
 
     for step in range(steps + 1):
