@@ -7,6 +7,16 @@ from typing import List, Tuple
 from .model import HBAR_MAPPING
 
 
+def _sample_gaussian_mapping_variables(n_states: int, rng: random.Random) -> Tuple[List[float], List[float]]:
+    std = math.sqrt(0.5)
+    map_r = []
+    map_p = []
+    for _ in range(n_states):
+        map_r.append(rng.gauss(0.0, std))
+        map_p.append(rng.gauss(0.0, std))
+    return map_r, map_p
+
+
 def sample_focused_mapping_variables(
     n_states: int,
     occupied_state: int,
@@ -15,12 +25,7 @@ def sample_focused_mapping_variables(
     if not (0 <= occupied_state < n_states):
         raise ValueError(f"occupied_state must be in [0, {n_states - 1}], got {occupied_state}.")
 
-    std = math.sqrt(0.5)
-    map_r = []
-    map_p = []
-    for _ in range(n_states):
-        map_r.append(rng.gauss(0.0, std))
-        map_p.append(rng.gauss(0.0, std))
+    map_r, map_p = _sample_gaussian_mapping_variables(n_states, rng)
 
     for i in range(n_states):
         target = (3.0 * HBAR_MAPPING) if i == occupied_state else HBAR_MAPPING
@@ -30,6 +35,31 @@ def sample_focused_mapping_variables(
             map_p[i] = 0.0
             continue
         scale = math.sqrt(target) / radius
+        map_r[i] *= scale
+        map_p[i] *= scale
+
+    return map_r, map_p
+
+
+def sample_global_norm_mapping_variables(
+    n_states: int,
+    rng: random.Random,
+) -> Tuple[List[float], List[float]]:
+    map_r, map_p = _sample_gaussian_mapping_variables(n_states, rng)
+
+    total_norm = 0.0
+    for i in range(n_states):
+        total_norm += map_r[i] * map_r[i] + map_p[i] * map_p[i]
+
+    target_total_norm = (n_states + 2.0) * HBAR_MAPPING
+    if total_norm < 1e-14:
+        map_r = [0.0 for _ in range(n_states)]
+        map_p = [0.0 for _ in range(n_states)]
+        map_r[0] = math.sqrt(target_total_norm)
+        return map_r, map_p
+
+    scale = math.sqrt(target_total_norm / total_norm)
+    for i in range(n_states):
         map_r[i] *= scale
         map_p[i] *= scale
 

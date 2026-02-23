@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - exercised when numba is not installed.
 
 from .diabatic import diabatic_r_range, interpolate_eigenstates, interpolate_h_diabatic, load_diabatic_tables
 from .io_utils import append_xyz_frame
-from .mapping import propagate_mapping_exact_half_step, sample_focused_mapping_variables
+from .mapping import propagate_mapping_exact_half_step, sample_focused_mapping_variables, sample_global_norm_mapping_variables
 from .model import (
     CHARGE,
     COULOMB_KCAL_MOL_ANG_E2,
@@ -1004,6 +1004,7 @@ def run_nve_md(
     fd_delta: float,
     occupied_state: int,
     mapping_seed: int,
+    mapping_init_mode: str,
     h_matrix_log_path: Path,
     mapping_log_path: Path,
     observables_log_path: Path,
@@ -1019,11 +1020,25 @@ def run_nve_md(
     diabatic_table = load_diabatic_tables(diabatic_path)
     r_min, r_max = diabatic_r_range(diabatic_table)
     n_states = int(diabatic_table.get("n_states", 3))
-    if not (0 <= occupied_state < n_states):
+    if mapping_init_mode not in {"focused", "global-norm"}:
+        raise ValueError("mapping_init_mode must be 'focused' or 'global-norm'.")
+    if mapping_init_mode == "focused" and not (0 <= occupied_state < n_states):
         raise ValueError(f"occupied_state must be in [0, {n_states - 1}], got {occupied_state}.")
+
     print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
     mapping_rng = random.Random(mapping_seed)
-    map_r, map_p = sample_focused_mapping_variables(n_states, occupied_state, mapping_rng)
+    if mapping_init_mode == "focused":
+        map_r, map_p = sample_focused_mapping_variables(n_states, occupied_state, mapping_rng)
+    else:
+        map_r, map_p = sample_global_norm_mapping_variables(n_states, mapping_rng)
+
+    init_norms = [map_r[i] * map_r[i] + map_p[i] * map_p[i] for i in range(n_states)]
+    init_total = sum(init_norms)
+    print(
+        "Initial mapping norms (R_i^2+P_i^2): "
+        + " ".join(f"M{i + 1}={m:.10f}" for i, m in enumerate(init_norms))
+        + f" | sum={init_total:.10f}"
+    )
 
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text(
@@ -1082,7 +1097,7 @@ def run_nve_md(
                 f"R_AB={float(terms['R_AB']):.6f} H_map={float(terms['H_map']):.6f} "
                 f"K={float(terms['K']):.6f} V_SS={float(terms['V_SS']):.6f} E_map={float(terms['E_map_coupling']):.6f} "
                 f"M=({','.join(f'{m:.3f}' for m in m_norms)}) T_noH={temperature:.3f} max|F|={max_force:.6f} "
-                f"occ={occupied_state + 1} FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
+                f"occ={(occupied_state + 1) if mapping_init_mode == 'focused' else 'NA'} FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
             ),
         )
 

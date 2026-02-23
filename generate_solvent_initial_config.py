@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
         help="Seed for mapping-variable sampling (defaults to --seed)",
     )
     parser.add_argument(
+        "--mapping-init-mode",
+        choices=("focused", "global-norm"),
+        default="focused",
+        help="Mapping initialization mode: focused per-state radii or global-norm Gaussian rescaling.",
+    )
+    parser.add_argument(
         "--kernel-backend",
         choices=("python", "numba"),
         default="python",
@@ -89,8 +95,8 @@ def main() -> None:
 
     diabatic_table = load_diabatic_tables(args.diabatic_json)
     n_states = int(diabatic_table.get("n_states", 3))
-    if not 1 <= args.occupied_state <= n_states:
-        raise ValueError(f"--occupied-state must be in [1, {n_states}] for the supplied diabatic table.")
+    if args.mapping_init_mode == "focused" and not 1 <= args.occupied_state <= n_states:
+        raise ValueError(f"--occupied-state must be in [1, {n_states}] for focused initialization.")
     mapping_seed = args.seed if args.mapping_seed is None else args.mapping_seed
     wall_radius = args.radius + args.wall_offset
 
@@ -108,6 +114,7 @@ def main() -> None:
         fd_delta=args.fd_delta,
         occupied_state=args.occupied_state - 1,
         mapping_seed=mapping_seed,
+        mapping_init_mode=args.mapping_init_mode,
         h_matrix_log_path=args.h_matrix_log,
         mapping_log_path=args.mapping_log,
         observables_log_path=args.observables_log,
@@ -119,10 +126,16 @@ def main() -> None:
     print(f"PBME dynamics run complete (steps={args.steps}, dt_fs={args.dt_fs}).")
     if args.validate_forces:
         print(f"Finite-difference force checks enabled (delta={args.fd_delta:.2e} A).")
-    print(
-        f"Mapping variables sampled from N(0,1/2) with focused rescaling; "
-        f"occupied state={args.occupied_state}, mapping_seed={mapping_seed}."
-    )
+    if args.mapping_init_mode == "focused":
+        print(
+            f"Mapping variables sampled from N(0,1/2) with focused rescaling; "
+            f"occupied state={args.occupied_state}, mapping_seed={mapping_seed}."
+        )
+    else:
+        print(
+            "Mapping variables sampled from N(0,1/2) with global-norm rescaling; "
+            f"target sum=(N+2)*hbar, mapping_seed={mapping_seed}."
+        )
     print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
     print(f"Energy log written to: {args.energy_log}")
