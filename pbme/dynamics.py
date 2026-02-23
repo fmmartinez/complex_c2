@@ -359,10 +359,11 @@ def compute_pbme_forces_and_hamiltonian(
     dab = [rb[k] - ra[k] for k in range(3)]
     r_ab = norm(dab)
     r_min, r_max = diabatic_r_range(diabatic_table)
-    r_ab_eval = min(max(r_ab, r_min), r_max)
+    if r_ab < r_min or r_ab > r_max:
+        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
 
-    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab_eval)
-    eigenstates = interpolate_eigenstates(diabatic_table, r_ab_eval)
+    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
+    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
     grid = diabatic_table["grid"]
     n_states = int(diabatic_table.get("n_states", len(h_diab)))
     if len(map_r) != n_states or len(map_p) != n_states:
@@ -401,7 +402,6 @@ def compute_pbme_forces_and_hamiltonian(
             "E_map_coupling": e_h,
             "H_map": h_map,
             "R_AB": r_ab,
-            "R_AB_eval": r_ab_eval,
             "dE_dRAB": dE_dR,
             "h_eff": h_eff.tolist(),
         }
@@ -424,11 +424,12 @@ def compute_pbme_forces_and_hamiltonian(
     dab = [rb[k] - ra[k] for k in range(3)]
     r_ab = norm(dab)
     r_min, r_max = diabatic_r_range(diabatic_table)
-    r_ab_eval = min(max(r_ab, r_min), r_max)
+    if r_ab < r_min or r_ab > r_max:
+        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
     uab = [dab[k] / max(r_ab, 1e-12) for k in range(3)]
 
-    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab_eval)
-    eigenstates = interpolate_eigenstates(diabatic_table, r_ab_eval)
+    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
+    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
     grid = diabatic_table["grid"]
 
     v_ss = 0.0
@@ -590,7 +591,6 @@ def compute_pbme_forces_and_hamiltonian(
         "E_map_coupling": e_h,
         "H_map": h_map,
         "R_AB": r_ab,
-        "R_AB_eval": r_ab_eval,
         "dE_dRAB": dE_dR,
         "h_eff": h_eff,
     }
