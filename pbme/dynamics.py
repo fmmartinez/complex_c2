@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     import numpy as np
@@ -1038,6 +1038,7 @@ def run_nve_md(
     fd_delta: float,
     occupied_state: int,
     mapping_seed: int,
+    occupied_state_choices: Optional[List[int]],
     mapping_init_mode: str,
     h_matrix_log_path: Path,
     mapping_log_path: Path,
@@ -1059,13 +1060,21 @@ def run_nve_md(
     n_states = int(diabatic_table.get("n_states", 3))
     if mapping_init_mode not in {"focused", "global-norm"}:
         raise ValueError("mapping_init_mode must be 'focused' or 'global-norm'.")
-    if mapping_init_mode == "focused" and not (0 <= occupied_state < n_states):
-        raise ValueError(f"occupied_state must be in [0, {n_states - 1}], got {occupied_state}.")
 
     print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
     mapping_rng = random.Random(mapping_seed)
+
+    selected_occupied_state = occupied_state
     if mapping_init_mode == "focused":
-        map_r, map_p = sample_focused_mapping_variables(n_states, occupied_state, mapping_rng)
+        if occupied_state_choices is None:
+            occupied_state_choices = [occupied_state]
+        if len(occupied_state_choices) == 0:
+            raise ValueError("occupied_state_choices must contain at least one state index for focused initialization.")
+        invalid = [idx for idx in occupied_state_choices if not (0 <= idx < n_states)]
+        if invalid:
+            raise ValueError(f"occupied_state_choices must be within [0, {n_states - 1}], got {invalid}.")
+        selected_occupied_state = mapping_rng.choice(occupied_state_choices)
+        map_r, map_p = sample_focused_mapping_variables(n_states, selected_occupied_state, mapping_rng)
     else:
         map_r, map_p = sample_global_norm_mapping_variables(n_states, mapping_rng)
 
@@ -1134,7 +1143,7 @@ def run_nve_md(
                 f"R_AB={float(terms['R_AB']):.6f} H_map={float(terms['H_map']):.6f} "
                 f"K={float(terms['K']):.6f} V_SS={float(terms['V_SS']):.6f} E_map={float(terms['E_map_coupling']):.6f} "
                 f"M=({','.join(f'{m:.3f}' for m in m_norms)}) T_noH={temperature:.3f} max|F|={max_force:.6f} "
-                f"occ={(occupied_state + 1) if mapping_init_mode == 'focused' else 'NA'} FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
+                f"occ={(selected_occupied_state + 1) if mapping_init_mode == 'focused' else 'NA'} FDmaxAbs={fd_summary['fd_max_abs_err']:.3e}"
             ),
         )
 

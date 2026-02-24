@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import List
 
 from pbme.diabatic import load_diabatic_tables
 from pbme.dynamics import generate_configuration, run_nve_md
@@ -48,7 +49,13 @@ def parse_args() -> argparse.Namespace:
         "--occupied-state",
         type=int,
         default=1,
-        help="Initially occupied mapping state index (1-based)",
+        help="Initially occupied mapping state index (1-based). Used when --occupied-state-set is not provided.",
+    )
+    parser.add_argument(
+        "--occupied-state-set",
+        type=str,
+        default=None,
+        help="Comma-separated 1-based focused states to sample from randomly per trajectory (e.g., '1,3').",
     )
     parser.add_argument(
         "--mapping-seed",
@@ -70,6 +77,19 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
+
+
+def _parse_occupied_state_set(spec: str) -> List[int]:
+    values: List[int] = []
+    for chunk in spec.split(','):
+        token = chunk.strip()
+        if not token:
+            continue
+        values.append(int(token))
+    if not values:
+        raise ValueError("--occupied-state-set must contain at least one 1-based state index.")
+    return values
 
 def main() -> None:
     args = parse_args()
@@ -97,8 +117,18 @@ def main() -> None:
 
     diabatic_table = load_diabatic_tables(args.diabatic_json)
     n_states = int(diabatic_table.get("n_states", 3))
-    if args.mapping_init_mode == "focused" and not 1 <= args.occupied_state <= n_states:
-        raise ValueError(f"--occupied-state must be in [1, {n_states}] for focused initialization.")
+    occupied_state_set_zero_based = None
+    if args.mapping_init_mode == "focused":
+        if args.occupied_state_set is None:
+            if not 1 <= args.occupied_state <= n_states:
+                raise ValueError(f"--occupied-state must be in [1, {n_states}] for focused initialization.")
+            occupied_state_set_zero_based = [args.occupied_state - 1]
+        else:
+            selected_1based = _parse_occupied_state_set(args.occupied_state_set)
+            invalid = [v for v in selected_1based if not 1 <= v <= n_states]
+            if invalid:
+                raise ValueError(f"--occupied-state-set indices must be in [1, {n_states}], got {invalid}.")
+            occupied_state_set_zero_based = [v - 1 for v in selected_1based]
     mapping_seed = args.seed if args.mapping_seed is None else args.mapping_seed
     wall_radius = args.radius + args.wall_offset
 
@@ -115,6 +145,7 @@ def main() -> None:
         validate_forces=args.validate_forces,
         fd_delta=args.fd_delta,
         occupied_state=args.occupied_state - 1,
+        occupied_state_choices=occupied_state_set_zero_based,
         mapping_seed=mapping_seed,
         mapping_init_mode=args.mapping_init_mode,
         h_matrix_log_path=args.h_matrix_log,
@@ -134,10 +165,16 @@ def main() -> None:
     if args.validate_forces:
         print(f"Finite-difference force checks enabled (delta={args.fd_delta:.2e} A).")
     if args.mapping_init_mode == "focused":
-        print(
-            f"Mapping variables sampled from N(0,1/2) with focused rescaling; "
-            f"occupied state={args.occupied_state}, mapping_seed={mapping_seed}."
-        )
+        if args.occupied_state_set is None:
+            print(
+                f"Mapping variables sampled from N(0,1/2) with focused rescaling; "
+                f"occupied state={args.occupied_state}, mapping_seed={mapping_seed}."
+            )
+        else:
+            print(
+                f"Mapping variables sampled from N(0,1/2) with focused rescaling; "
+                f"random occupied state from {{{args.occupied_state_set}}}, mapping_seed={mapping_seed}."
+            )
     else:
         print(
             "Mapping variables sampled from N(0,1/2) with global-norm rescaling; "
