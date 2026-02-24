@@ -242,12 +242,6 @@ def _compute_forces_numba_core(
         for k in range(3):
             rh[k] = ra[k] + uab[k] * r_ah
 
-        e_ab, dUdr_ab = _coulomb_energy_dudr_numba(r_ab, q_a, q_b)
-        wg = weights[g] * omega[g]
-        for i in range(n_states):
-            for j in range(n_states):
-                v_cs[i, j] += weights[g] * eigenstates[i, g] * eigenstates[j, g] * e_ab
-
         for s_idx in range(2 * n_solvent_molecules):
             rs = positions[s_idx]
             qs = 0.25 if type_codes[s_idx] == 0 else -0.25
@@ -276,6 +270,7 @@ def _compute_forces_numba_core(
             e_bs, dUdr_bs = _coulomb_energy_dudr_numba(r_bs, q_b, qs)
 
             v_gs = e_hs + e_as + e_bs
+            wg = weights[g] * omega[g]
             for i in range(n_states):
                 for j in range(n_states):
                     v_cs[i, j] += weights[g] * eigenstates[i, g] * eigenstates[j, g] * v_gs
@@ -324,17 +319,6 @@ def _compute_forces_numba_core(
             forces[s_idx, 0] -= wg * f_b0
             forces[s_idx, 1] -= wg * f_b1
             forces[s_idx, 2] -= wg * f_b2
-
-        scale_ab = -dUdr_ab / max(r_ab, 1e-12)
-        f_ab0 = scale_ab * dab[0]
-        f_ab1 = scale_ab * dab[1]
-        f_ab2 = scale_ab * dab[2]
-        forces[idx_b, 0] += wg * f_ab0
-        forces[idx_b, 1] += wg * f_ab1
-        forces[idx_b, 2] += wg * f_ab2
-        forces[idx_a, 0] -= wg * f_ab0
-        forces[idx_a, 1] -= wg * f_ab1
-        forces[idx_a, 2] -= wg * f_ab2
 
     k_total = 0.0
     for i in range(positions.shape[0]):
@@ -537,12 +521,6 @@ def compute_pbme_forces_and_hamiltonian(
         rh = [ra[k] + uab[k] * r_ah for k in range(3)]
         projector = [[eigenstates[i][g] * eigenstates[j][g] for j in range(n_states)] for i in range(n_states)]
 
-        e_ab, dUdr_ab = coulomb_energy_dudr(r_ab, q_a, q_b)
-        wg = weights[g] * omega[g]
-        for i in range(n_states):
-            for j in range(n_states):
-                v_cs[i][j] += weights[g] * projector[i][j] * e_ab
-
         for s_idx in range(2 * n_solvent_molecules):
             ss = sites[s_idx]
             rs = ss.position_angstrom
@@ -572,6 +550,7 @@ def compute_pbme_forces_and_hamiltonian(
             e_bs, dUdr_bs = coulomb_energy_dudr(r_bs, q_b, qs)
 
             v_gs = e_hs + e_as + e_bs
+            wg = weights[g] * omega[g]
             for i in range(n_states):
                 for j in range(n_states):
                     v_cs[i][j] += weights[g] * projector[i][j] * v_gs
@@ -607,15 +586,6 @@ def compute_pbme_forces_and_hamiltonian(
             forces[s_idx][0] -= wg * f_b[0]
             forces[s_idx][1] -= wg * f_b[1]
             forces[s_idx][2] -= wg * f_b[2]
-
-        scale_ab = -dUdr_ab / max(r_ab, 1e-12)
-        f_ab = [scale_ab * dab[0], scale_ab * dab[1], scale_ab * dab[2]]
-        forces[idx_b][0] += wg * f_ab[0]
-        forces[idx_b][1] += wg * f_ab[1]
-        forces[idx_b][2] += wg * f_ab[2]
-        forces[idx_a][0] -= wg * f_ab[0]
-        forces[idx_a][1] -= wg * f_ab[1]
-        forces[idx_a][2] -= wg * f_ab[2]
 
     k_total = kinetic_energy_kcal_mol(sites, exclude_h=True)
 
