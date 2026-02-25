@@ -1040,6 +1040,7 @@ def run_nve_md(
     mapping_seed: int,
     occupied_state_choices: Optional[List[int]],
     mapping_init_mode: str,
+    mapping_substeps: int,
     h_matrix_log_path: Path,
     mapping_log_path: Path,
     observables_log_path: Path,
@@ -1060,6 +1061,8 @@ def run_nve_md(
     n_states = int(diabatic_table.get("n_states", 3))
     if mapping_init_mode not in {"focused", "global-norm"}:
         raise ValueError("mapping_init_mode must be 'focused' or 'global-norm'.")
+    if mapping_substeps < 1:
+        raise ValueError(f"mapping_substeps must be >= 1, got {mapping_substeps}.")
 
     print(f"Diabatic model active range from JSON: R_AB in [{r_min:.6f}, {r_max:.6f}] Angstrom")
     mapping_rng = random.Random(mapping_seed)
@@ -1171,7 +1174,9 @@ def run_nve_md(
             site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
-        propagate_mapping_exact_half_step(map_r, map_p, curr_terms["h_eff"], 0.5 * dt_fs)
+        dt_map_half = 0.5 * dt_fs / mapping_substeps
+        for _ in range(mapping_substeps):
+            propagate_mapping_exact_half_step(map_r, map_p, curr_terms["h_eff"], dt_map_half)
 
         for site in sites:
             if site.site_type == "H":
@@ -1194,7 +1199,8 @@ def run_nve_md(
                     flog.write(f"# terminated at step {step_idx + 1}: {exc}\n")
             return False, curr_forces, curr_terms
 
-        propagate_mapping_exact_half_step(map_r, map_p, new_terms["h_eff"], 0.5 * dt_fs)
+        for _ in range(mapping_substeps):
+            propagate_mapping_exact_half_step(map_r, map_p, new_terms["h_eff"], dt_map_half)
 
         for idx, site in enumerate(sites):
             if site.site_type == "H":

@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         help="Mapping initialization mode: focused per-state radii or global-norm Gaussian rescaling.",
     )
     parser.add_argument(
+        "--mapping-substeps",
+        type=int,
+        default=1,
+        help="Number of frozen-h_eff mapping substeps per half-kick (1 disables sub-cycling).",
+    )
+    parser.add_argument(
         "--kernel-backend",
         choices=("python", "numba"),
         default="python",
@@ -148,6 +154,7 @@ def main() -> None:
         occupied_state_choices=occupied_state_set_zero_based,
         mapping_seed=mapping_seed,
         mapping_init_mode=args.mapping_init_mode,
+        mapping_substeps=args.mapping_substeps,
         h_matrix_log_path=args.h_matrix_log,
         mapping_log_path=args.mapping_log,
         observables_log_path=args.observables_log,
@@ -162,6 +169,7 @@ def main() -> None:
     print(f"PBME dynamics run complete (steps={args.steps}, dt_fs={args.dt_fs}).")
     print(f"Equilibration stage: {args.equilibration_ps:.3f} ps (velocity rescaling every 100 fs), then production NVE.")
     print(f"R_AB edge taper width: {args.edge_taper_width_angstrom:.4f} Angstrom")
+    print(f"Mapping substeps per half-kick: {args.mapping_substeps}")
     if args.validate_forces:
         print(f"Finite-difference force checks enabled (delta={args.fd_delta:.2e} A).")
     if args.mapping_init_mode == "focused":
