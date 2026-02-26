@@ -924,9 +924,6 @@ def compute_legacy_mapping_forces_and_hamiltonian(
     return result.forces, result.terms
 
 
-compute_pbme_forces_and_hamiltonian = compute_legacy_mapping_forces_and_hamiltonian
-
-
 def clone_sites(sites: List[Site]) -> List[Site]:
     return [
         Site(
