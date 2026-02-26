@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Aggregate PBME trajectory logs and plot smooth histograms/KDEs."""
+"""Aggregate FBTS trajectory logs and plot smooth histograms/KDEs."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot smooth aggregated histograms from PBME logs.")
+    parser = argparse.ArgumentParser(description="Plot smooth aggregated histograms from FBTS logs.")
     parser.add_argument("--ensemble-root", type=Path, default=Path("ensemble_runs"))
-    parser.add_argument("--pattern", type=str, default="traj_*/pbme_observables.log")
+    parser.add_argument("--pattern", type=str, default="traj_*/fbts_observables.log")
     parser.add_argument("--output-dir", type=Path, default=Path("ensemble_runs/analysis"))
     parser.add_argument("--grid-size", type=int, default=200)
     parser.add_argument("--dpi", type=int, default=180)
@@ -25,13 +25,7 @@ def parse_args() -> argparse.Namespace:
         "--n-states",
         type=int,
         default=2,
-        help="Subsystem state count used for mapping/effective-H parsing (default: 2).",
-    )
-    parser.add_argument(
-        "--hbar-mapping",
-        type=float,
-        default=0.01594,
-        help="HBAR_MAPPING used for mapping population conversion (default: 0.01594).",
+        help="Subsystem state count used for electronic/effective-H parsing (default: 2).",
     )
     parser.add_argument(
         "--diabatic-json",
@@ -88,28 +82,41 @@ def _parse_effective_h_gap(path: Path) -> List[float]:
     return gaps
 
 
-def _parse_mapping_populations(path: Path, n_states: int, hbar_mapping: float) -> Tuple[List[List[float]], int]:
+def _parse_fbts_electronic(path: Path, n_states: int) -> Tuple[List[List[float]], Dict[str, List[float]]]:
     pops: List[List[float]] = [[] for _ in range(n_states)]
-    available_states = 0
+    diagnostics: Dict[str, List[float]] = {}
 
     lines = path.read_text(encoding="utf-8").splitlines()
+    header_tokens: List[str] = []
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         parts = stripped.split()
         if parts and parts[0] == "step":
-            for token in parts[2:]:
-                if token.startswith("M") and token[1:].isdigit():
-                    available_states += 1
-                else:
-                    break
+            header_tokens = parts
             break
+    if not header_tokens:
+        return pops, diagnostics
 
-    if available_states == 0:
-        return pops, 0
+    idx_map = {tok: i for i, tok in enumerate(header_tokens)}
 
-    use_states = min(n_states, available_states)
+    pop_indices: List[int] = []
+    for i in range(1, n_states + 1):
+        tok = f"pop{i}"
+        if tok in idx_map:
+            pop_indices.append(idx_map[tok])
+
+    rho_diag_re_indices: List[int] = []
+    for i in range(1, n_states + 1):
+        tok = f"rho{i}{i}_re"
+        if tok in idx_map:
+            rho_diag_re_indices.append(idx_map[tok])
+
+    diag_keys = [tok for tok in header_tokens if "weight" in tok.lower()]
+    for k in diag_keys:
+        diagnostics[k] = []
+
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -117,26 +124,40 @@ def _parse_mapping_populations(path: Path, n_states: int, hbar_mapping: float) -
         parts = stripped.split()
         if not parts or parts[0] == "step":
             continue
-        needed = 2 + use_states
-        if len(parts) < needed:
-            continue
-        ok = True
-        vals = []
-        for i in range(use_states):
-            try:
-                m_i = float(parts[2 + i])
-            except ValueError:
-                ok = False
-                break
-            if not np.isfinite(m_i):
-                ok = False
-                break
-            vals.append((m_i - hbar_mapping) / (2.0 * hbar_mapping))
-        if ok:
-            for i, v in enumerate(vals):
-                pops[i].append(v)
 
-    return pops, available_states
+        if pop_indices:
+            for i, idx in enumerate(pop_indices[:n_states]):
+                if idx >= len(parts):
+                    continue
+                try:
+                    v = float(parts[idx])
+                except ValueError:
+                    continue
+                if np.isfinite(v):
+                    pops[i].append(v)
+        elif rho_diag_re_indices:
+            for i, idx in enumerate(rho_diag_re_indices[:n_states]):
+                if idx >= len(parts):
+                    continue
+                try:
+                    v = float(parts[idx])
+                except ValueError:
+                    continue
+                if np.isfinite(v):
+                    pops[i].append(v)
+
+        for k in diag_keys:
+            idx = idx_map[k]
+            if idx >= len(parts):
+                continue
+            try:
+                v = float(parts[idx])
+            except ValueError:
+                continue
+            if np.isfinite(v):
+                diagnostics[k].append(v)
+
+    return pops, diagnostics
 
 
 def _load_rab_bounds_from_diabatic(path: Path) -> Tuple[float, float]:
@@ -164,6 +185,7 @@ def _parse_rab_series(path: Path) -> List[float]:
         if np.isfinite(rab):
             rabs.append(rab)
     return rabs
+
 
 def _scott_bandwidth_1d(values: np.ndarray, scale: float) -> float:
     n = max(values.size, 2)
@@ -262,6 +284,7 @@ def main() -> None:
     rab_all: List[float] = []
     gaps_all: List[float] = []
     pops_all: List[List[float]] = [[] for _ in range(args.n_states)]
+    weight_diag_all: Dict[str, List[float]] = {}
 
     if args.rab_bins <= 0:
         raise ValueError("--rab-bins must be >= 1.")
@@ -277,7 +300,7 @@ def main() -> None:
         pol_all.extend(pol)
         com_all.extend(com)
 
-        h_path_for_rab = traj_dir / "pbme_effective_hamiltonian.log"
+        h_path_for_rab = traj_dir / "fbts_effective_hamiltonian.log"
         if h_path_for_rab.exists():
             rabs = _parse_rab_series(h_path_for_rab)
             rab_all.extend(rabs)
@@ -290,7 +313,7 @@ def main() -> None:
                 rab = rabs[i]
                 if rab < rab_min or rab > rab_max:
                     continue
-                bin_idx = int(np.searchsorted(rab_edges, rab, side='right') - 1)
+                bin_idx = int(np.searchsorted(rab_edges, rab, side="right") - 1)
                 if bin_idx == args.rab_bins:
                     bin_idx = args.rab_bins - 1
                 if 0 <= bin_idx < args.rab_bins:
@@ -299,19 +322,16 @@ def main() -> None:
         else:
             print(f"Warning: missing {h_path_for_rab}; skipping R_AB-binned observables for this trajectory.")
 
-        map_path = traj_dir / "pbme_mapping.log"
-        if map_path.exists():
-            pops, available_states = _parse_mapping_populations(map_path, args.n_states, args.hbar_mapping)
-            if available_states < args.n_states:
-                print(
-                    f"Warning: {map_path} provides only {available_states} mapping norms (M_i), "
-                    f"requested n_states={args.n_states}; missing states will be skipped."
-                )
+        elec_path = traj_dir / "fbts_electronic.log"
+        if elec_path.exists():
+            pops, diagnostics = _parse_fbts_electronic(elec_path, args.n_states)
             for i in range(args.n_states):
                 pops_all[i].extend(pops[i])
+            for k, vals in diagnostics.items():
+                weight_diag_all.setdefault(k, []).extend(vals)
 
         if args.n_states == 2:
-            h_path = traj_dir / "pbme_effective_hamiltonian.log"
+            h_path = traj_dir / "fbts_effective_hamiltonian.log"
             if h_path.exists():
                 gaps_all.extend(_parse_effective_h_gap(h_path))
 
@@ -342,7 +362,7 @@ def main() -> None:
             color="tab:purple",
         )
     else:
-        print("Warning: no valid R_AB samples found in pbme_effective_hamiltonian.log files; skipping R_AB histogram.")
+        print("Warning: no valid R_AB samples found in fbts_effective_hamiltonian.log files; skipping R_AB histogram.")
 
     gx, gy, dens = _kde_2d(com_arr, pol_arr, args.grid_size, args.bandwidth_scale, args.chunk_size)
     plt.figure(figsize=(7.2, 5.6))
@@ -386,20 +406,20 @@ def main() -> None:
                 color="tab:green",
             )
         else:
-            print("Warning: n_states=2 but no valid pbme_effective_hamiltonian.log samples found; skipping gap histogram.")
+            print("Warning: n_states=2 but no valid fbts_effective_hamiltonian.log samples found; skipping gap histogram.")
     else:
         print(f"Warning: n_states={args.n_states}; gap histogram (H22-H11) is only generated for n_states=2.")
 
     pop_outs: List[Path] = []
     for i in range(args.n_states):
         if not pops_all[i]:
-            print(f"Warning: no valid mapping population samples found for state {i + 1}; skipping.")
+            print(f"Warning: no valid FBTS population samples found for state {i + 1}; skipping.")
             continue
         pop_arr = np.asarray(pops_all[i], dtype=np.float64)
-        out = args.output_dir / f"mapping_population_state_{i + 1}_kde.png"
+        out = args.output_dir / f"fbts_population_state_{i + 1}_kde.png"
         _plot_1d_kde(
             pop_arr,
-            f"Mapping population KDE, state {i + 1}\nN={pop_arr.size} samples",
+            f"FBTS population KDE, state {i + 1}\nN={pop_arr.size} samples",
             f"Population state {i + 1}",
             out,
             args,
@@ -407,6 +427,21 @@ def main() -> None:
         )
         pop_outs.append(out)
 
+    weight_outs: List[Path] = []
+    for key, values in weight_diag_all.items():
+        if not values:
+            continue
+        arr = np.asarray(values, dtype=np.float64)
+        out = args.output_dir / f"{key}_kde.png"
+        _plot_1d_kde(
+            arr,
+            f"FBTS diagnostic KDE: {key}\nN={arr.size} samples",
+            key,
+            out,
+            args,
+            color="tab:brown",
+        )
+        weight_outs.append(out)
 
     rab_pol_outs: List[Path] = []
     rab_com_outs: List[Path] = []
@@ -445,7 +480,7 @@ def main() -> None:
     print(f"Discovered {len(obs_files)} trajectory observable log files.")
     print(f"Aggregated {pol_arr.size} observables samples.")
     print(f"KDE chunk size: {args.chunk_size}")
-    print(f"Assumed n_states: {args.n_states}; hbar_mapping: {args.hbar_mapping}")
+    print(f"Assumed n_states: {args.n_states}")
     print(f"R_AB bins: {args.rab_bins} across [{rab_min:.6f}, {rab_max:.6f}] from {args.diabatic_json}")
     print(f"Wrote: {out_pol}")
     print(f"Wrote: {out_com}")
@@ -456,6 +491,8 @@ def main() -> None:
     if out_gap is not None:
         print(f"Wrote: {out_gap}")
     for out in pop_outs:
+        print(f"Wrote: {out}")
+    for out in weight_outs:
         print(f"Wrote: {out}")
     for out in rab_pol_outs:
         print(f"Wrote: {out}")
