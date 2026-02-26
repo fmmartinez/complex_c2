@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run multiple PBME trajectories in parallel via subprocess CLI invocations."""
+"""Run multiple FBTS trajectories in parallel via subprocess CLI invocations."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def detect_available_cpus() -> int:
 class TrajectoryResult:
     trajectory_id: int
     seed: int
-    mapping_seed: int
+    electronic_seed: int
     output_dir: str
     status: str
     returncode: int
@@ -52,8 +52,8 @@ class TrajectoryResult:
 def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, List[str]]:
     parser = argparse.ArgumentParser(
         description=(
-            "Run an ensemble of independent PBME trajectories in parallel. "
-            "Unknown args are forwarded to generate_solvent_initial_config.py."
+            "Run an ensemble of independent FBTS trajectories in parallel. "
+            "Unknown args are forwarded to the FBTS driver script."
         )
     )
     parser.add_argument("--n-trajectories", type=int, required=True, help="Total number of trajectories to run")
@@ -61,10 +61,10 @@ def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, List[str]]:
     parser.add_argument("--max-workers", type=int, default=None, help="Max concurrent trajectories (defaults to detected CPUs)")
     parser.add_argument("--base-seed", type=int, default=20260218, help="Base random seed; each trajectory uses base_seed + traj_id")
     parser.add_argument(
-        "--base-mapping-seed",
+        "--base-electronic-seed",
         type=int,
         default=None,
-        help="Base mapping seed; each trajectory uses base_mapping_seed + traj_id (default: base_seed)",
+        help="Base electronic seed; each trajectory uses base_electronic_seed + traj_id (default: base_seed)",
     )
     parser.add_argument(
         "--python-executable",
@@ -75,7 +75,7 @@ def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, List[str]]:
     parser.add_argument(
         "--driver-script",
         type=Path,
-        default=Path("generate_solvent_initial_config.py"),
+        default=Path("run_fbts_simulation.py"),
         help="Path to single-trajectory driver script",
     )
 
@@ -89,10 +89,30 @@ def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, List[str]]:
     return args, passthrough
 
 
+def _sanitize_passthrough_args(passthrough_args: Sequence[str]) -> List[str]:
+    """Drop deprecated legacy passthrough args that conflict with FBTS driver flags."""
+    deprecated_with_value = {"--mapping-seed", "--mapping-log", "--mapping-init-mode", "--mapping-substeps"}
+    sanitized: List[str] = []
+    skip_next = False
+    for token in passthrough_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in deprecated_with_value:
+            skip_next = True
+            continue
+        if token.startswith("--mapping-"):
+            continue
+        sanitized.append(token)
+    return sanitized
+
+
+
+
 def run_single_trajectory(
     trajectory_id: int,
     seed: int,
-    mapping_seed: int,
+    electronic_seed: int,
     output_dir: Path,
     python_executable: str,
     driver_script: Path,
@@ -106,20 +126,20 @@ def run_single_trajectory(
         *passthrough_args,
         "--seed",
         str(seed),
-        "--mapping-seed",
-        str(mapping_seed),
+        "--electronic-seed",
+        str(electronic_seed),
         "--initial-output",
-        str(output_dir / "pbme_initial.xyz"),
+        str(output_dir / "fbts_initial.xyz"),
         "--trajectory",
-        str(output_dir / "pbme_trajectory.xyz"),
+        str(output_dir / "fbts_trajectory.xyz"),
         "--energy-log",
-        str(output_dir / "pbme_energy.log"),
+        str(output_dir / "fbts_energy.log"),
         "--h-matrix-log",
-        str(output_dir / "pbme_effective_hamiltonian.log"),
-        "--mapping-log",
-        str(output_dir / "pbme_mapping.log"),
+        str(output_dir / "fbts_effective_hamiltonian.log"),
+        "--electronic-log",
+        str(output_dir / "fbts_electronic.log"),
         "--observables-log",
-        str(output_dir / "pbme_observables.log"),
+        str(output_dir / "fbts_observables.log"),
     ]
 
     start = time.perf_counter()
@@ -135,7 +155,7 @@ def run_single_trajectory(
     return TrajectoryResult(
         trajectory_id=trajectory_id,
         seed=seed,
-        mapping_seed=mapping_seed,
+        electronic_seed=electronic_seed,
         output_dir=str(output_dir),
         status=status,
         returncode=completed.returncode,
@@ -146,6 +166,7 @@ def run_single_trajectory(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args, passthrough = parse_args(argv if argv is not None else sys.argv[1:])
+    passthrough = _sanitize_passthrough_args(passthrough)
 
     output_root = args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
@@ -154,7 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     max_workers = args.max_workers if args.max_workers is not None else detected_cpus
     max_workers = max(1, min(max_workers, args.n_trajectories))
 
-    base_mapping_seed = args.base_seed if args.base_mapping_seed is None else args.base_mapping_seed
+    base_electronic_seed = args.base_seed if args.base_electronic_seed is None else args.base_electronic_seed
 
     print(
         f"Starting ensemble: n_trajectories={args.n_trajectories}, "
@@ -167,13 +188,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         future_map = {}
         for traj_id in range(args.n_trajectories):
             seed = args.base_seed + traj_id
-            mapping_seed = base_mapping_seed + traj_id
+            electronic_seed = base_electronic_seed + traj_id
             traj_dir = output_root / f"traj_{traj_id:06d}"
             future = executor.submit(
                 run_single_trajectory,
                 traj_id,
                 seed,
-                mapping_seed,
+                electronic_seed,
                 traj_dir,
                 args.python_executable,
                 args.driver_script,
@@ -189,7 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = TrajectoryResult(
                     trajectory_id=traj_id,
                     seed=args.base_seed + traj_id,
-                    mapping_seed=base_mapping_seed + traj_id,
+                    electronic_seed=base_electronic_seed + traj_id,
                     output_dir=str(output_root / f"traj_{traj_id:06d}"),
                     status="failed",
                     returncode=-1,
@@ -211,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             fieldnames=[
                 "trajectory_id",
                 "seed",
-                "mapping_seed",
+                "electronic_seed",
                 "output_dir",
                 "status",
                 "returncode",
@@ -225,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "trajectory_id": r.trajectory_id,
                     "seed": r.seed,
-                    "mapping_seed": r.mapping_seed,
+                    "electronic_seed": r.electronic_seed,
                     "output_dir": r.output_dir,
                     "status": r.status,
                     "returncode": r.returncode,
