@@ -4,7 +4,7 @@ import math
 import random
 from typing import List, Tuple
 
-from .model import HBAR_MAPPING
+from .model import PLANCK_REDUCED_KCAL_MOL_FS
 
 
 def _sample_gaussian_mapping_variables(n_states: int, rng: random.Random) -> Tuple[List[float], List[float]]:
@@ -28,7 +28,7 @@ def sample_focused_mapping_variables(
     map_r, map_p = _sample_gaussian_mapping_variables(n_states, rng)
 
     for i in range(n_states):
-        target = (3.0 * HBAR_MAPPING) if i == occupied_state else HBAR_MAPPING
+        target = (3.0 * PLANCK_REDUCED_KCAL_MOL_FS) if i == occupied_state else PLANCK_REDUCED_KCAL_MOL_FS
         radius = math.sqrt(map_r[i] * map_r[i] + map_p[i] * map_p[i])
         if radius < 1e-14:
             map_r[i] = math.sqrt(target)
@@ -51,7 +51,7 @@ def sample_global_norm_mapping_variables(
     for i in range(n_states):
         total_norm += map_r[i] * map_r[i] + map_p[i] * map_p[i]
 
-    target_total_norm = (n_states + 2.0) * HBAR_MAPPING
+    target_total_norm = (n_states + 2.0) * PLANCK_REDUCED_KCAL_MOL_FS
     if total_norm < 1e-14:
         map_r = [0.0 for _ in range(n_states)]
         map_p = [0.0 for _ in range(n_states)]
@@ -76,8 +76,8 @@ def compute_mapping_derivatives(h_eff: List[List[float]], map_r: List[float], ma
         for j in range(n_states):
             val_r += h_eff[i][j] * map_p[j]
             val_p += h_eff[i][j] * map_r[j]
-        dr_dt[i] = val_r / HBAR_MAPPING
-        dp_dt[i] = -val_p / HBAR_MAPPING
+        dr_dt[i] = val_r / PLANCK_REDUCED_KCAL_MOL_FS
+        dp_dt[i] = -val_p / PLANCK_REDUCED_KCAL_MOL_FS
     return dr_dt, dp_dt
 
 
@@ -156,7 +156,7 @@ def propagate_mapping_exact_half_step(map_r: List[float], map_p: List[float], h_
     r_rot = [0.0 for _ in range(n_states)]
     p_rot = [0.0 for _ in range(n_states)]
     for i in range(n_states):
-        theta = evals[i] * dt_half_fs / HBAR_MAPPING
+        theta = evals[i] * dt_half_fs / PLANCK_REDUCED_KCAL_MOL_FS
         c = math.cos(theta)
         s = math.sin(theta)
         r_rot[i] = c * r_mode[i] + s * p_mode[i]
