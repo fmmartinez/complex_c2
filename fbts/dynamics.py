@@ -255,6 +255,279 @@ def _compute_bath_and_coupling_matrices_python(
 
 
 
+
+
+@dataclass
+class ForceContext:
+    base_forces: List[List[float]]
+    force_templates: List[List[List[float]]]
+    v_ss: float
+    v_cs: List[List[float]]
+    h_diab: List[List[float]]
+    dh_diab_eff: List[List[float]]
+    h_eff: List[List[float]]
+    eigenstates: List[List[float]]
+    omega_projector: List[List[List[float]]]
+    r_ab: float
+    uab: List[float]
+    idx_a: int
+    idx_b: int
+    w_taper: float
+    kernel_backend: str
+
+
+def prepare_force_context(
+    sites: List[Site],
+    n_solvent_molecules: int,
+    diabatic_table: Dict[str, object],
+    kernel_backend: str = "python",
+    edge_taper_width_angstrom: float = 0.02,
+) -> ForceContext:
+    _validate_fbts_kernel_backend(kernel_backend)
+
+    idx_a = idx_h = idx_b = None
+    for idx, site in enumerate(sites):
+        if site.site_type == "A":
+            idx_a = idx
+        elif site.site_type == "H":
+            idx_h = idx
+        elif site.site_type == "B":
+            idx_b = idx
+    if idx_a is None or idx_h is None or idx_b is None:
+        raise RuntimeError("Complex A/H/B sites not found.")
+
+    ra = sites[idx_a].position_angstrom
+    rb = sites[idx_b].position_angstrom
+    dab = [rb[k] - ra[k] for k in range(3)]
+    r_ab = norm(dab)
+    uab = [dab[k] / max(r_ab, 1e-12) for k in range(3)]
+
+    r_min, r_max = diabatic_r_range(diabatic_table)
+    if r_ab < r_min or r_ab > r_max:
+        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
+
+    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
+    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
+    grid = diabatic_table["grid"]
+    n_states = int(diabatic_table.get("n_states", len(h_diab)))
+
+    w_taper = _edge_taper_weight(r_ab, r_min, r_max, edge_taper_width_angstrom)
+    dh_diab_eff = [[w_taper * dh_diab[i][j] for j in range(n_states)] for i in range(n_states)]
+
+    base_forces = [[0.0, 0.0, 0.0] for _ in sites]
+    v_ss = 0.0
+    for i in range(len(sites)):
+        si = sites[i]
+        xi, yi, zi = si.position_angstrom
+        for j in range(i + 1, len(sites)):
+            sj = sites[j]
+            if si.molecule_id == sj.molecule_id and si.molecule_id < n_solvent_molecules:
+                continue
+            pair = {si.site_type, sj.site_type}
+            dx = xi - sj.position_angstrom[0]
+            dy = yi - sj.position_angstrom[1]
+            dz = zi - sj.position_angstrom[2]
+            r = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            if pair.issubset({"C1", "C2"}) or pair in ({"A", "C1"}, {"A", "C2"}, {"B", "C1"}, {"B", "C2"}):
+                lj_params = get_lj_params(si.site_type, sj.site_type)
+                if lj_params is not None:
+                    sigma, epsilon = lj_params
+                    e_lj, dUdr = lj_energy_dudr(r, sigma, epsilon)
+                    v_ss += e_lj
+                    scale = -dUdr / max(r, 1e-12)
+                    fx, fy, fz = scale * dx, scale * dy, scale * dz
+                    base_forces[i][0] += fx
+                    base_forces[i][1] += fy
+                    base_forces[i][2] += fz
+                    base_forces[j][0] -= fx
+                    base_forces[j][1] -= fy
+                    base_forces[j][2] -= fz
+                if pair.issubset({"C1", "C2"}):
+                    qi = CHARGE[si.site_type]
+                    qj = CHARGE[sj.site_type]
+                    e_c, dUdr = coulomb_energy_dudr(r, qi, qj)
+                    v_ss += e_c
+                    scale = -dUdr / max(r, 1e-12)
+                    fx, fy, fz = scale * dx, scale * dy, scale * dz
+                    base_forces[i][0] += fx
+                    base_forces[i][1] += fy
+                    base_forces[i][2] += fz
+                    base_forces[j][0] -= fx
+                    base_forces[j][1] -= fy
+                    base_forces[j][2] -= fz
+
+    ngrid = len(grid)
+    weights = [PROTON_GRID_STEP] * ngrid
+    weights[0] *= 0.5
+    weights[-1] *= 0.5
+
+    v_cs = [[0.0] * n_states for _ in range(n_states)]
+    force_templates = [[[0.0, 0.0, 0.0] for _ in sites] for _ in range(ngrid)]
+    omega_projector = [[[0.0 for _ in range(n_states)] for _ in range(n_states)] for _ in range(ngrid)]
+
+    for g, r_ah in enumerate(grid):
+        for i in range(n_states):
+            for j in range(n_states):
+                omega_projector[g][i][j] = eigenstates[i][g] * eigenstates[j][g] / (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
+
+        fpol, _ = polarization_switch(r_ah)
+        q_a = (1.0 - fpol) * POLARIZATION["Q_A_cov"] + fpol * POLARIZATION["Q_A_ion"]
+        q_h = (1.0 - fpol) * POLARIZATION["Q_H_cov"] + fpol * POLARIZATION["Q_H_ion"]
+        q_b = (1.0 - fpol) * POLARIZATION["Q_B_cov"] + fpol * POLARIZATION["Q_B_ion"]
+
+        rh = [ra[k] + uab[k] * r_ah for k in range(3)]
+        projector = [[eigenstates[i][g] * eigenstates[j][g] for j in range(n_states)] for i in range(n_states)]
+
+        for s_idx in range(2 * n_solvent_molecules):
+            ss = sites[s_idx]
+            rs = ss.position_angstrom
+            qs = CHARGE[ss.site_type]
+
+            dx = rh[0] - rs[0]
+            dy = rh[1] - rs[1]
+            dz = rh[2] - rs[2]
+            r_hs = math.sqrt(dx * dx + dy * dy + dz * dz)
+            e_hs = 0.0
+            dUdr_hs = 0.0
+            if abs(q_h * qs) > 0.0:
+                e_c, d_c = coulomb_energy_dudr(r_hs, q_h, qs)
+                e_hs += e_c
+                dUdr_hs += d_c
+
+            dxa = ra[0] - rs[0]
+            dya = ra[1] - rs[1]
+            dza = ra[2] - rs[2]
+            r_as = math.sqrt(dxa * dxa + dya * dya + dza * dza)
+            e_as, dUdr_as = coulomb_energy_dudr(r_as, q_a, qs)
+
+            dxb = rb[0] - rs[0]
+            dyb = rb[1] - rs[1]
+            dzb = rb[2] - rs[2]
+            r_bs = math.sqrt(dxb * dxb + dyb * dyb + dzb * dzb)
+            e_bs, dUdr_bs = coulomb_energy_dudr(r_bs, q_b, qs)
+
+            v_gs = e_hs + e_as + e_bs
+            for i in range(n_states):
+                for j in range(n_states):
+                    v_cs[i][j] += weights[g] * projector[i][j] * v_gs
+
+            wg1 = weights[g]
+            if abs(e_hs) > 0.0:
+                scale_h = -dUdr_hs / max(r_hs, 1e-12)
+                f_h = [scale_h * dx, scale_h * dy, scale_h * dz]
+                force_templates[g][s_idx][0] -= wg1 * f_h[0]
+                force_templates[g][s_idx][1] -= wg1 * f_h[1]
+                force_templates[g][s_idx][2] -= wg1 * f_h[2]
+
+                proj = [[(1.0 if a == b else 0.0) - (r_ah / max(r_ab, 1e-12)) * ((1.0 if a == b else 0.0) - uab[a] * uab[b]) for b in range(3)] for a in range(3)]
+                for a in range(3):
+                    force_templates[g][idx_a][a] += wg1 * sum(proj[b][a] * f_h[b] for b in range(3))
+                proj_b = [[(r_ah / max(r_ab, 1e-12)) * ((1.0 if a == b else 0.0) - uab[a] * uab[b]) for b in range(3)] for a in range(3)]
+                for a in range(3):
+                    force_templates[g][idx_b][a] += wg1 * sum(proj_b[b][a] * f_h[b] for b in range(3))
+
+            scale_a = -dUdr_as / max(r_as, 1e-12)
+            f_a = [scale_a * dxa, scale_a * dya, scale_a * dza]
+            force_templates[g][idx_a][0] += wg1 * f_a[0]
+            force_templates[g][idx_a][1] += wg1 * f_a[1]
+            force_templates[g][idx_a][2] += wg1 * f_a[2]
+            force_templates[g][s_idx][0] -= wg1 * f_a[0]
+            force_templates[g][s_idx][1] -= wg1 * f_a[1]
+            force_templates[g][s_idx][2] -= wg1 * f_a[2]
+
+            scale_b = -dUdr_bs / max(r_bs, 1e-12)
+            f_b = [scale_b * dxb, scale_b * dyb, scale_b * dzb]
+            force_templates[g][idx_b][0] += wg1 * f_b[0]
+            force_templates[g][idx_b][1] += wg1 * f_b[1]
+            force_templates[g][idx_b][2] += wg1 * f_b[2]
+            force_templates[g][s_idx][0] -= wg1 * f_b[0]
+            force_templates[g][s_idx][1] -= wg1 * f_b[1]
+            force_templates[g][s_idx][2] -= wg1 * f_b[2]
+
+    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(n_states)] for i in range(n_states)]
+
+    return ForceContext(
+        base_forces=base_forces,
+        force_templates=force_templates,
+        v_ss=v_ss,
+        v_cs=v_cs,
+        h_diab=h_diab,
+        dh_diab_eff=dh_diab_eff,
+        h_eff=h_eff,
+        eigenstates=eigenstates,
+        omega_projector=omega_projector,
+        r_ab=r_ab,
+        uab=uab,
+        idx_a=idx_a,
+        idx_b=idx_b,
+        w_taper=w_taper,
+        kernel_backend=kernel_backend,
+    )
+
+
+def compute_fbts_forces_from_context(
+    sites: List[Site],
+    fbts_state: FBTSElectronicState,
+    context: ForceContext,
+) -> ForceEvalResult:
+    n_states = len(context.h_eff)
+    if not (len(fbts_state.r_f) == len(fbts_state.p_f) == len(fbts_state.r_b) == len(fbts_state.p_b) == n_states):
+        raise RuntimeError("FBTS electronic state dimension mismatch with force context.")
+
+    estimator_matrix = _fbts_estimator_matrix(fbts_state)
+    omega = [0.0 for _ in range(len(context.omega_projector))]
+    for g in range(len(context.omega_projector)):
+        val = 0.0
+        for i in range(n_states):
+            for j in range(n_states):
+                val += estimator_matrix[i][j] * context.omega_projector[g][i][j]
+        omega[g] = val
+
+    forces = [row[:] for row in context.base_forces]
+    for g in range(len(context.force_templates)):
+        wg = omega[g]
+        if abs(wg) < 1e-18:
+            continue
+        tpl = context.force_templates[g]
+        for s_idx in range(len(forces)):
+            forces[s_idx][0] += wg * tpl[s_idx][0]
+            forces[s_idx][1] += wg * tpl[s_idx][1]
+            forces[s_idx][2] += wg * tpl[s_idx][2]
+
+    k_total = kinetic_energy_kcal_mol(sites, exclude_h=True)
+    e_h = 0.0
+    dE_dR = 0.0
+    for i in range(n_states):
+        for j in range(n_states):
+            e_h += context.h_eff[i][j] * estimator_matrix[i][j]
+            dE_dR += context.dh_diab_eff[i][j] * estimator_matrix[i][j]
+    e_h /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
+    dE_dR /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
+
+    for k in range(3):
+        f_b = -dE_dR * context.uab[k]
+        forces[context.idx_b][k] += f_b
+        forces[context.idx_a][k] -= f_b
+
+    h_fbts = k_total + context.v_ss + e_h
+    terms = {
+        "K": k_total,
+        "V_SS": context.v_ss,
+        "E_fbts_coupling": e_h,
+        "H_fbts": h_fbts,
+        "R_AB": context.r_ab,
+        "w_RAB_taper": context.w_taper,
+        "dE_dRAB": dE_dR,
+        "h_eff": context.h_eff,
+        "v_cs": context.v_cs,
+        "estimator_matrix": estimator_matrix,
+        "omega": omega,
+        "kernel_backend": context.kernel_backend,
+    }
+    return ForceEvalResult(forces=forces, terms=terms)
+
+
 def _edge_taper_weight(r_ab: float, r_min: float, r_max: float, taper_width: float) -> float:
     if taper_width <= 0.0:
         return 1.0
@@ -820,81 +1093,14 @@ def compute_fbts_forces_and_hamiltonian(
     kernel_backend: str = "python",
     edge_taper_width_angstrom: float = 0.02,
 ) -> ForceEvalResult:
-    _validate_fbts_kernel_backend(kernel_backend)
-
-    ra = rb = None
-    for site in sites:
-        if site.site_type == "A":
-            ra = site.position_angstrom
-        elif site.site_type == "B":
-            rb = site.position_angstrom
-    if ra is None or rb is None:
-        raise RuntimeError("Complex A/B sites not found.")
-
-    r_ab = norm([rb[k] - ra[k] for k in range(3)])
-    r_min, r_max = diabatic_r_range(diabatic_table)
-    if r_ab < r_min or r_ab > r_max:
-        raise RuntimeError(f"R_AB={r_ab:.6f} outside diabatic table range [{r_min:.6f}, {r_max:.6f}].")
-
-    h_diab, dh_diab = interpolate_h_diabatic(diabatic_table, r_ab)
-    eigenstates = interpolate_eigenstates(diabatic_table, r_ab)
-    grid = diabatic_table["grid"]
-    n_states = int(diabatic_table.get("n_states", len(h_diab)))
-
-    if not (
-        len(fbts_state.r_f) == len(fbts_state.p_f) == len(fbts_state.r_b) == len(fbts_state.p_b) == n_states
-    ):
-        raise RuntimeError("FBTS electronic state dimension mismatch with diabatic model.")
-
-    w_taper = _edge_taper_weight(r_ab, r_min, r_max, edge_taper_width_angstrom)
-    dh_diab_eff = [[w_taper * dh_diab[i][j] for j in range(n_states)] for i in range(n_states)]
-
-    estimator_matrix = _fbts_estimator_matrix(fbts_state)
-    forces, v_ss, v_cs, r_ab, idx_a, idx_b, omega, uab, _ra, _rb = _compute_bath_and_coupling_matrices_python(
-        sites,
-        n_solvent_molecules,
-        grid,
-        eigenstates,
-        estimator_matrix,
-        n_states,
+    context = prepare_force_context(
+        sites=sites,
+        n_solvent_molecules=n_solvent_molecules,
+        diabatic_table=diabatic_table,
+        kernel_backend=kernel_backend,
+        edge_taper_width_angstrom=edge_taper_width_angstrom,
     )
-
-    k_total = kinetic_energy_kcal_mol(sites, exclude_h=True)
-    h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(n_states)] for i in range(n_states)]
-
-    e_h = 0.0
-    dE_dR = 0.0
-    for i in range(n_states):
-        for j in range(n_states):
-            e_h += h_eff[i][j] * estimator_matrix[i][j]
-            dE_dR += dh_diab_eff[i][j] * estimator_matrix[i][j]
-    e_h /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
-    dE_dR /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
-
-    for k in range(3):
-        f_b = -dE_dR * uab[k]
-        forces[idx_b][k] += f_b
-        forces[idx_a][k] -= f_b
-
-    h_map = k_total + v_ss + e_h
-    terms = {
-        "K": k_total,
-        "V_SS": v_ss,
-        "E_fbts_coupling": e_h,
-        "E_map_coupling": e_h,
-        "H_fbts": h_map,
-        "H_map": h_map,
-        "R_AB": r_ab,
-        "w_RAB_taper": w_taper,
-        "dE_dRAB": dE_dR,
-        "h_eff": h_eff,
-        "v_cs": v_cs,
-        "estimator_matrix": estimator_matrix,
-        "omega": omega,
-        "kernel_backend": kernel_backend,
-    }
-    return ForceEvalResult(forces=forces, terms=terms)
-
+    return compute_fbts_forces_from_context(sites, fbts_state, context)
 
 
 def compute_legacy_mapping_forces_and_hamiltonian(
@@ -1408,19 +1614,19 @@ def run_nve_md(
 
     def _evaluate_fbts_ensemble(step_idx: int) -> Tuple[List[List[float]], Dict[str, object], List[List[complex]]]:
         used_states = fbts_states if (step_idx % estimator_averaging_cadence == 0) else [fbts_states[0]]
+        context = prepare_force_context(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            diabatic_table=diabatic_table,
+            kernel_backend=kernel_backend,
+            edge_taper_width_angstrom=edge_taper_width_angstrom,
+        )
         acc_forces = [[0.0, 0.0, 0.0] for _ in sites]
         acc_terms: Optional[Dict[str, object]] = None
         acc_rho = [[0j for _ in range(n_states)] for _ in range(n_states)]
 
         for st in used_states:
-            eval_result = compute_fbts_forces_and_hamiltonian(
-                sites=sites,
-                n_solvent_molecules=n_solvent_molecules,
-                diabatic_table=diabatic_table,
-                fbts_state=st,
-                kernel_backend=kernel_backend,
-                edge_taper_width_angstrom=edge_taper_width_angstrom,
-            )
+            eval_result = compute_fbts_forces_from_context(sites=sites, fbts_state=st, context=context)
             f = eval_result.forces
             t = eval_result.terms
             for i in range(len(sites)):
@@ -1436,7 +1642,7 @@ def run_nve_md(
             if acc_terms is None:
                 acc_terms = dict(t)
             else:
-                for key in ("K", "V_SS", "E_fbts_coupling", "E_map_coupling", "H_fbts", "H_map", "R_AB", "w_RAB_taper", "dE_dRAB"):
+                for key in ("K", "V_SS", "E_fbts_coupling", "H_fbts", "R_AB", "w_RAB_taper", "dE_dRAB"):
                     acc_terms[key] = float(acc_terms[key]) + float(t[key])
                 for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
                     for i in range(n_states):
@@ -1451,7 +1657,7 @@ def run_nve_md(
             acc_forces[i][1] /= n_used
             acc_forces[i][2] /= n_used
         assert acc_terms is not None
-        for key in ("K", "V_SS", "E_fbts_coupling", "E_map_coupling", "H_fbts", "H_map", "R_AB", "w_RAB_taper", "dE_dRAB"):
+        for key in ("K", "V_SS", "E_fbts_coupling", "H_fbts", "R_AB", "w_RAB_taper", "dE_dRAB"):
             acc_terms[key] = float(acc_terms[key]) / n_used
         for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
             for i in range(n_states):
