@@ -38,7 +38,9 @@ LJ_PARAMS: Dict[Tuple[str, str], Tuple[float, float]] = {
     ("B", "C2"): (3.5, 0.3974),
 }
 
-HBAR_MAPPING = 0.01594  # (kcal/mol)*fs
+PLANCK_REDUCED_KCAL_MOL_FS = 0.01594  # Reduced Planck constant in (kcal/mol)*fs used by FBTS equations.
+# Backward-compatible alias; prefer PLANCK_REDUCED_KCAL_MOL_FS in new code.
+HBAR_MAPPING = PLANCK_REDUCED_KCAL_MOL_FS
 PROTON_GRID_MIN = 0.3
 PROTON_GRID_STEP = 0.02
 
