@@ -5,6 +5,24 @@ import random
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None  # type: ignore[assignment]
+
+try:
+    from numba import njit
+
+    NUMBA_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    NUMBA_AVAILABLE = False
+
+    def njit(*_args, **_kwargs):  # type: ignore[no-redef]
+        def decorator(func):
+            return func
+
+        return decorator
+
 from .model import PLANCK_REDUCED_KCAL_MOL_FS
 
 
@@ -36,6 +54,95 @@ class FBTSEnsembleSample:
 
     state: FBTSElectronicState
     mode: str
+
+
+@dataclass
+class FBTSPropagator:
+    """Precomputed linear propagator for a fixed Hamiltonian slice and dt."""
+
+    evecs: object
+    cos_theta: object
+    sin_theta: object
+
+
+def build_fbts_propagator(h_eff: List[List[float]], dt_fs: float) -> Optional[FBTSPropagator]:
+    """Build a reusable propagator for repeated FBTS updates with the same h_eff and dt."""
+
+    if dt_fs == 0.0:
+        return None
+    if NUMBA_AVAILABLE and np is not None:
+        return _build_fbts_propagator_numba(h_eff, dt_fs)
+    hsym = _symmetrize_matrix(h_eff)
+    evals, evecs = _jacobi_eigh(hsym)
+    theta_scale = dt_fs / PLANCK_REDUCED_KCAL_MOL_FS
+    cos_theta = [math.cos(ev * theta_scale) for ev in evals]
+    sin_theta = [math.sin(ev * theta_scale) for ev in evals]
+    return FBTSPropagator(evecs=evecs, cos_theta=cos_theta, sin_theta=sin_theta)
+
+
+@njit(cache=True)
+def _jacobi_eigh_numba(h: "np.ndarray", max_iter: int = 200, tol: float = 1e-14) -> Tuple["np.ndarray", "np.ndarray"]:
+    n = h.shape[0]
+    a = h.copy()
+    v = np.eye(n, dtype=np.float64)
+
+    for _ in range(max_iter):
+        p = 0
+        q = 1 if n > 1 else 0
+        off = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                aij = abs(a[i, j])
+                if aij > off:
+                    off = aij
+                    p = i
+                    q = j
+
+        if off < tol:
+            break
+
+        app = a[p, p]
+        aqq = a[q, q]
+        apq = a[p, q]
+        phi = 0.5 * math.atan2(2.0 * apq, aqq - app)
+        c = math.cos(phi)
+        s = math.sin(phi)
+
+        for k in range(n):
+            if k == p or k == q:
+                continue
+            akp = a[k, p]
+            akq = a[k, q]
+            a[k, p] = c * akp - s * akq
+            a[p, k] = a[k, p]
+            a[k, q] = s * akp + c * akq
+            a[q, k] = a[k, q]
+
+        a[p, p] = c * c * app - 2.0 * s * c * apq + s * s * aqq
+        a[q, q] = s * s * app + 2.0 * s * c * apq + c * c * aqq
+        a[p, q] = 0.0
+        a[q, p] = 0.0
+
+        for k in range(n):
+            vkp = v[k, p]
+            vkq = v[k, q]
+            v[k, p] = c * vkp - s * vkq
+            v[k, q] = s * vkp + c * vkq
+
+    evals = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        evals[i] = a[i, i]
+    return evals, v
+
+
+def _build_fbts_propagator_numba(h_eff: List[List[float]], dt_fs: float) -> FBTSPropagator:
+    h_np = np.asarray(h_eff, dtype=np.float64)
+    hsym = 0.5 * (h_np + h_np.T)
+    evals, evecs = _jacobi_eigh_numba(hsym)
+    theta_scale = dt_fs / PLANCK_REDUCED_KCAL_MOL_FS
+    cos_theta = np.cos(evals * theta_scale)
+    sin_theta = np.sin(evals * theta_scale)
+    return FBTSPropagator(evecs=evecs, cos_theta=cos_theta, sin_theta=sin_theta)
 
 
 def _validate_n_states(n_states: int) -> None:
@@ -182,7 +289,13 @@ def _jacobi_eigh(h: List[List[float]], max_iter: int = 200, tol: float = 1e-14) 
     return evals, v
 
 
-def _propagate_one_set(r: List[float], p: List[float], evals: List[float], evecs: List[List[float]], dt_fs: float) -> None:
+def _propagate_one_set(
+    r: List[float],
+    p: List[float],
+    evecs: List[List[float]],
+    cos_theta: List[float],
+    sin_theta: List[float],
+) -> None:
     n_states = len(r)
     r_mode = [sum(evecs[row][col] * r[row] for row in range(n_states)) for col in range(n_states)]
     p_mode = [sum(evecs[row][col] * p[row] for row in range(n_states)) for col in range(n_states)]
@@ -190,9 +303,8 @@ def _propagate_one_set(r: List[float], p: List[float], evals: List[float], evecs
     r_rot = [0.0 for _ in range(n_states)]
     p_rot = [0.0 for _ in range(n_states)]
     for i in range(n_states):
-        theta = evals[i] * dt_fs / PLANCK_REDUCED_KCAL_MOL_FS
-        c = math.cos(theta)
-        s = math.sin(theta)
+        c = cos_theta[i]
+        s = sin_theta[i]
         r_rot[i] = c * r_mode[i] + s * p_mode[i]
         p_rot[i] = c * p_mode[i] - s * r_mode[i]
 
@@ -201,13 +313,16 @@ def _propagate_one_set(r: List[float], p: List[float], evals: List[float], evecs
         p[row] = sum(evecs[row][col] * p_rot[col] for col in range(n_states))
 
 
+def propagate_fbts_state_with_propagator(state: FBTSElectronicState, propagator: Optional[FBTSPropagator]) -> None:
+    """Advance FBTS mapping variables using a precomputed propagator."""
+
+    if propagator is None:
+        return
+    _propagate_one_set(state.r_f, state.p_f, propagator.evecs, propagator.cos_theta, propagator.sin_theta)
+    _propagate_one_set(state.r_b, state.p_b, propagator.evecs, propagator.cos_theta, propagator.sin_theta)
+
+
 def propagate_fbts_state_exact_step(state: FBTSElectronicState, h_eff: List[List[float]], dt_fs: float) -> None:
     """Advance forward and backward mapping variables under the same Hamiltonian slice."""
 
-    if dt_fs == 0.0:
-        return
-    hsym = _symmetrize_matrix(h_eff)
-    evals, evecs = _jacobi_eigh(hsym)
-
-    _propagate_one_set(state.r_f, state.p_f, evals, evecs, dt_fs)
-    _propagate_one_set(state.r_b, state.p_b, evals, evecs, dt_fs)
+    propagate_fbts_state_with_propagator(state, build_fbts_propagator(h_eff, dt_fs))

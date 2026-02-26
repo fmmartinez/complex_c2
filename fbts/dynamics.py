@@ -30,7 +30,8 @@ from .electronic import (
     FBTSElectronicState,
     initialize_coherent_fbts_state,
     initialize_focused_fbts_state,
-    propagate_fbts_state_exact_step,
+    build_fbts_propagator,
+    propagate_fbts_state_with_propagator,
 )
 from .model import (
     CHARGE,
@@ -71,7 +72,7 @@ AMU_ANG2_FS2_TO_KCAL_MOL = 2390.05736055072
 
 @dataclass
 class ForceEvalResult:
-    forces: List[List[float]]
+    forces: object
     terms: Dict[str, object]
 
 
@@ -286,6 +287,7 @@ class ForceContext:
     h_eff_np: Optional["np.ndarray"] = None
     dh_diab_eff_np: Optional["np.ndarray"] = None
     omega_projector_np: Optional["np.ndarray"] = None
+    uab_np: Optional["np.ndarray"] = None
 
 
 def prepare_force_context(
@@ -459,13 +461,14 @@ def prepare_force_context(
 
     h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(n_states)] for i in range(n_states)]
 
-    base_forces_np = force_templates_np = h_eff_np = dh_diab_eff_np = omega_projector_np = None
+    base_forces_np = force_templates_np = h_eff_np = dh_diab_eff_np = omega_projector_np = uab_np = None
     if kernel_backend == "numba":
         base_forces_np = np.asarray(base_forces, dtype=np.float64)
         force_templates_np = np.asarray(force_templates, dtype=np.float64)
         h_eff_np = np.asarray(h_eff, dtype=np.float64)
         dh_diab_eff_np = np.asarray(dh_diab_eff, dtype=np.float64)
         omega_projector_np = np.asarray(omega_projector, dtype=np.float64)
+        uab_np = np.asarray(uab, dtype=np.float64)
 
     return ForceContext(
         base_forces=base_forces,
@@ -488,6 +491,7 @@ def prepare_force_context(
         h_eff_np=h_eff_np,
         dh_diab_eff_np=dh_diab_eff_np,
         omega_projector_np=omega_projector_np,
+        uab_np=uab_np,
     )
 
 
@@ -552,25 +556,35 @@ def compute_fbts_forces_from_context(
     if not (len(fbts_state.r_f) == len(fbts_state.p_f) == len(fbts_state.r_b) == len(fbts_state.p_b) == n_states):
         raise RuntimeError("FBTS electronic state dimension mismatch with force context.")
 
-    estimator_matrix = _fbts_estimator_matrix(fbts_state)
-
     if context.kernel_backend == "numba":
-        est_np = np.asarray(estimator_matrix, dtype=np.float64)
-        uab_np = np.asarray(context.uab, dtype=np.float64)
-        forces_np, omega_np, e_h, dE_dR = _compute_pair_terms_from_context_numba(
+        est_np = np.empty((n_states, n_states), dtype=np.float64)
+        for i in range(n_states):
+            rf_i = fbts_state.r_f[i]
+            pf_i = fbts_state.p_f[i]
+            rb_i = fbts_state.r_b[i]
+            pb_i = fbts_state.p_b[i]
+            for j in range(n_states):
+                est_np[i, j] = 0.5 * (
+                    rf_i * fbts_state.r_b[j]
+                    + pf_i * fbts_state.p_b[j]
+                    + rb_i * fbts_state.r_f[j]
+                    + pb_i * fbts_state.p_f[j]
+                )
+
+        forces, omega, e_h, dE_dR = _compute_pair_terms_from_context_numba(
             estimator_matrix=est_np,
             base_forces=context.base_forces_np,
             force_templates=context.force_templates_np,
             omega_projector=context.omega_projector_np,
             h_eff=context.h_eff_np,
             dh_diab_eff=context.dh_diab_eff_np,
-            uab=uab_np,
+            uab=context.uab_np,
             idx_a=context.idx_a,
             idx_b=context.idx_b,
         )
-        forces = forces_np.tolist()
-        omega = omega_np.tolist()
+        estimator_matrix = est_np
     else:
+        estimator_matrix = _fbts_estimator_matrix(fbts_state)
         omega = [0.0 for _ in range(len(context.omega_projector))]
         for g in range(len(context.omega_projector)):
             val = 0.0
@@ -615,8 +629,8 @@ def compute_fbts_forces_from_context(
         "R_AB": context.r_ab,
         "w_RAB_taper": context.w_taper,
         "dE_dRAB": dE_dR,
-        "h_eff": context.h_eff,
-        "v_cs": context.v_cs,
+        "h_eff": context.h_eff_np if context.kernel_backend == "numba" else context.h_eff,
+        "v_cs": np.asarray(context.v_cs, dtype=np.float64) if context.kernel_backend == "numba" else context.v_cs,
         "estimator_matrix": estimator_matrix,
         "omega": omega,
         "kernel_backend": context.kernel_backend,
@@ -1708,7 +1722,7 @@ def run_nve_md(
                 rho[i][j] = (cf * cb) / (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
         return rho
 
-    def _evaluate_fbts_ensemble(step_idx: int) -> Tuple[List[List[float]], Dict[str, object], List[List[complex]]]:
+    def _evaluate_fbts_ensemble(step_idx: int) -> Tuple[object, Dict[str, object], List[List[complex]]]:
         used_states = fbts_states if (step_idx % estimator_averaging_cadence == 0) else [fbts_states[0]]
         context = prepare_force_context(
             sites=sites,
@@ -1717,7 +1731,8 @@ def run_nve_md(
             kernel_backend=kernel_backend,
             edge_taper_width_angstrom=edge_taper_width_angstrom,
         )
-        acc_forces = [[0.0, 0.0, 0.0] for _ in sites]
+        use_numba_path = kernel_backend == "numba"
+        acc_forces = np.zeros((len(sites), 3), dtype=np.float64) if use_numba_path else [[0.0, 0.0, 0.0] for _ in sites]
         acc_terms: Optional[Dict[str, object]] = None
         acc_rho = [[0j for _ in range(n_states)] for _ in range(n_states)]
 
@@ -1725,10 +1740,13 @@ def run_nve_md(
             eval_result = compute_fbts_forces_from_context(sites=sites, fbts_state=st, context=context)
             f = eval_result.forces
             t = eval_result.terms
-            for i in range(len(sites)):
-                acc_forces[i][0] += f[i][0]
-                acc_forces[i][1] += f[i][1]
-                acc_forces[i][2] += f[i][2]
+            if use_numba_path:
+                acc_forces += f
+            else:
+                for i in range(len(sites)):
+                    acc_forces[i][0] += f[i][0]
+                    acc_forces[i][1] += f[i][1]
+                    acc_forces[i][2] += f[i][2]
 
             rho = _rho_from_state(st)
             for i in range(n_states):
@@ -1740,27 +1758,39 @@ def run_nve_md(
             else:
                 for key in ("K", "V_SS", "E_fbts_coupling", "H_fbts", "R_AB", "w_RAB_taper", "dE_dRAB"):
                     acc_terms[key] = float(acc_terms[key]) + float(t[key])
-                for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
-                    for i in range(n_states):
-                        for j in range(n_states):
-                            acc_terms[mat_key][i][j] += t[mat_key][i][j]
-                for g in range(len(acc_terms["omega"])):
-                    acc_terms["omega"][g] += t["omega"][g]
+                if use_numba_path:
+                    for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
+                        acc_terms[mat_key] = acc_terms[mat_key] + t[mat_key]
+                    acc_terms["omega"] = acc_terms["omega"] + t["omega"]
+                else:
+                    for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
+                        for i in range(n_states):
+                            for j in range(n_states):
+                                acc_terms[mat_key][i][j] += t[mat_key][i][j]
+                    for g in range(len(acc_terms["omega"])):
+                        acc_terms["omega"][g] += t["omega"][g]
 
         n_used = float(len(used_states))
-        for i in range(len(sites)):
-            acc_forces[i][0] /= n_used
-            acc_forces[i][1] /= n_used
-            acc_forces[i][2] /= n_used
+        if use_numba_path:
+            acc_forces /= n_used
+        else:
+            for i in range(len(sites)):
+                acc_forces[i][0] /= n_used
+                acc_forces[i][1] /= n_used
+                acc_forces[i][2] /= n_used
         assert acc_terms is not None
         for key in ("K", "V_SS", "E_fbts_coupling", "H_fbts", "R_AB", "w_RAB_taper", "dE_dRAB"):
             acc_terms[key] = float(acc_terms[key]) / n_used
-        for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
-            for i in range(n_states):
-                for j in range(n_states):
-                    acc_terms[mat_key][i][j] /= n_used
-        for g in range(len(acc_terms["omega"])):
-            acc_terms["omega"][g] /= n_used
+        if use_numba_path:
+            for mat_key in ("h_eff", "v_cs", "estimator_matrix", "omega"):
+                acc_terms[mat_key] = acc_terms[mat_key] / n_used
+        else:
+            for mat_key in ("h_eff", "v_cs", "estimator_matrix"):
+                for i in range(n_states):
+                    for j in range(n_states):
+                        acc_terms[mat_key][i][j] /= n_used
+            for g in range(len(acc_terms["omega"])):
+                acc_terms["omega"][g] /= n_used
 
         for i in range(n_states):
             for j in range(n_states):
@@ -1861,9 +1891,10 @@ def run_nve_md(
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
         dt_map_half = 0.5 * dt_fs / mapping_substeps
+        curr_propagator = build_fbts_propagator(curr_terms["h_eff"], dt_map_half)
         for _ in range(mapping_substeps):
             for st in fbts_states:
-                propagate_fbts_state_exact_step(st, curr_terms["h_eff"], dt_map_half)
+                propagate_fbts_state_with_propagator(st, curr_propagator)
 
         for site in sites:
             if site.site_type == "H":
@@ -1883,9 +1914,10 @@ def run_nve_md(
                     flog.write(f"# terminated at step {step_idx + 1}: {exc}\n")
             return False, curr_forces, curr_terms, [[0j for _ in range(n_states)] for _ in range(n_states)]
 
+        new_propagator = build_fbts_propagator(new_terms["h_eff"], dt_map_half)
         for _ in range(mapping_substeps):
             for st in fbts_states:
-                propagate_fbts_state_exact_step(st, new_terms["h_eff"], dt_map_half)
+                propagate_fbts_state_with_propagator(st, new_propagator)
 
         for idx, site in enumerate(sites):
             if site.site_type == "H":
