@@ -76,8 +76,15 @@ class ForceEvalResult:
 
 
 def _validate_fbts_kernel_backend(kernel_backend: str) -> None:
-    if kernel_backend != "python":
-        raise ValueError("FBTS path currently supports kernel_backend='python' only.")
+    supported_backends = ("python", "numba")
+    if kernel_backend not in supported_backends:
+        allowed = ", ".join(repr(name) for name in supported_backends)
+        raise ValueError(f"Unsupported kernel_backend={kernel_backend!r}; expected one of: {allowed}.")
+    if kernel_backend == "numba":
+        if not NUMBA_AVAILABLE:
+            raise RuntimeError("Numba backend requested but numba is not installed.")
+        if np is None:
+            raise RuntimeError("Numba backend requested but numpy is not installed.")
 
 
 def _fbts_estimator_matrix(state: FBTSElectronicState) -> List[List[float]]:
@@ -274,6 +281,11 @@ class ForceContext:
     idx_b: int
     w_taper: float
     kernel_backend: str
+    base_forces_np: Optional["np.ndarray"] = None
+    force_templates_np: Optional["np.ndarray"] = None
+    h_eff_np: Optional["np.ndarray"] = None
+    dh_diab_eff_np: Optional["np.ndarray"] = None
+    omega_projector_np: Optional["np.ndarray"] = None
 
 
 def prepare_force_context(
@@ -447,6 +459,14 @@ def prepare_force_context(
 
     h_eff = [[h_diab[i][j] + v_cs[i][j] for j in range(n_states)] for i in range(n_states)]
 
+    base_forces_np = force_templates_np = h_eff_np = dh_diab_eff_np = omega_projector_np = None
+    if kernel_backend == "numba":
+        base_forces_np = np.asarray(base_forces, dtype=np.float64)
+        force_templates_np = np.asarray(force_templates, dtype=np.float64)
+        h_eff_np = np.asarray(h_eff, dtype=np.float64)
+        dh_diab_eff_np = np.asarray(dh_diab_eff, dtype=np.float64)
+        omega_projector_np = np.asarray(omega_projector, dtype=np.float64)
+
     return ForceContext(
         base_forces=base_forces,
         force_templates=force_templates,
@@ -463,8 +483,65 @@ def prepare_force_context(
         idx_b=idx_b,
         w_taper=w_taper,
         kernel_backend=kernel_backend,
+        base_forces_np=base_forces_np,
+        force_templates_np=force_templates_np,
+        h_eff_np=h_eff_np,
+        dh_diab_eff_np=dh_diab_eff_np,
+        omega_projector_np=omega_projector_np,
     )
 
+
+
+
+@njit(cache=True)
+def _compute_pair_terms_from_context_numba(
+    estimator_matrix: np.ndarray,
+    base_forces: np.ndarray,
+    force_templates: np.ndarray,
+    omega_projector: np.ndarray,
+    h_eff: np.ndarray,
+    dh_diab_eff: np.ndarray,
+    uab: np.ndarray,
+    idx_a: int,
+    idx_b: int,
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    ngrid = omega_projector.shape[0]
+    n_states = estimator_matrix.shape[0]
+    n_sites = base_forces.shape[0]
+
+    omega = np.zeros(ngrid, dtype=np.float64)
+    for g in range(ngrid):
+        val = 0.0
+        for i in range(n_states):
+            for j in range(n_states):
+                val += estimator_matrix[i, j] * omega_projector[g, i, j]
+        omega[g] = val
+
+    forces = base_forces.copy()
+    for g in range(ngrid):
+        wg = omega[g]
+        if abs(wg) < 1e-18:
+            continue
+        for s_idx in range(n_sites):
+            forces[s_idx, 0] += wg * force_templates[g, s_idx, 0]
+            forces[s_idx, 1] += wg * force_templates[g, s_idx, 1]
+            forces[s_idx, 2] += wg * force_templates[g, s_idx, 2]
+
+    e_h = 0.0
+    dE_dR = 0.0
+    for i in range(n_states):
+        for j in range(n_states):
+            e_h += h_eff[i, j] * estimator_matrix[i, j]
+            dE_dR += dh_diab_eff[i, j] * estimator_matrix[i, j]
+    e_h /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
+    dE_dR /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
+
+    for k in range(3):
+        f_b = -dE_dR * uab[k]
+        forces[idx_b, k] += f_b
+        forces[idx_a, k] -= f_b
+
+    return forces, omega, e_h, dE_dR
 
 def compute_fbts_forces_from_context(
     sites: List[Site],
@@ -476,39 +553,58 @@ def compute_fbts_forces_from_context(
         raise RuntimeError("FBTS electronic state dimension mismatch with force context.")
 
     estimator_matrix = _fbts_estimator_matrix(fbts_state)
-    omega = [0.0 for _ in range(len(context.omega_projector))]
-    for g in range(len(context.omega_projector)):
-        val = 0.0
+
+    if context.kernel_backend == "numba":
+        est_np = np.asarray(estimator_matrix, dtype=np.float64)
+        uab_np = np.asarray(context.uab, dtype=np.float64)
+        forces_np, omega_np, e_h, dE_dR = _compute_pair_terms_from_context_numba(
+            estimator_matrix=est_np,
+            base_forces=context.base_forces_np,
+            force_templates=context.force_templates_np,
+            omega_projector=context.omega_projector_np,
+            h_eff=context.h_eff_np,
+            dh_diab_eff=context.dh_diab_eff_np,
+            uab=uab_np,
+            idx_a=context.idx_a,
+            idx_b=context.idx_b,
+        )
+        forces = forces_np.tolist()
+        omega = omega_np.tolist()
+    else:
+        omega = [0.0 for _ in range(len(context.omega_projector))]
+        for g in range(len(context.omega_projector)):
+            val = 0.0
+            for i in range(n_states):
+                for j in range(n_states):
+                    val += estimator_matrix[i][j] * context.omega_projector[g][i][j]
+            omega[g] = val
+
+        forces = [row[:] for row in context.base_forces]
+        for g in range(len(context.force_templates)):
+            wg = omega[g]
+            if abs(wg) < 1e-18:
+                continue
+            tpl = context.force_templates[g]
+            for s_idx in range(len(forces)):
+                forces[s_idx][0] += wg * tpl[s_idx][0]
+                forces[s_idx][1] += wg * tpl[s_idx][1]
+                forces[s_idx][2] += wg * tpl[s_idx][2]
+
+        e_h = 0.0
+        dE_dR = 0.0
         for i in range(n_states):
             for j in range(n_states):
-                val += estimator_matrix[i][j] * context.omega_projector[g][i][j]
-        omega[g] = val
+                e_h += context.h_eff[i][j] * estimator_matrix[i][j]
+                dE_dR += context.dh_diab_eff[i][j] * estimator_matrix[i][j]
+        e_h /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
+        dE_dR /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
 
-    forces = [row[:] for row in context.base_forces]
-    for g in range(len(context.force_templates)):
-        wg = omega[g]
-        if abs(wg) < 1e-18:
-            continue
-        tpl = context.force_templates[g]
-        for s_idx in range(len(forces)):
-            forces[s_idx][0] += wg * tpl[s_idx][0]
-            forces[s_idx][1] += wg * tpl[s_idx][1]
-            forces[s_idx][2] += wg * tpl[s_idx][2]
+        for k in range(3):
+            f_b = -dE_dR * context.uab[k]
+            forces[context.idx_b][k] += f_b
+            forces[context.idx_a][k] -= f_b
 
     k_total = kinetic_energy_kcal_mol(sites, exclude_h=True)
-    e_h = 0.0
-    dE_dR = 0.0
-    for i in range(n_states):
-        for j in range(n_states):
-            e_h += context.h_eff[i][j] * estimator_matrix[i][j]
-            dE_dR += context.dh_diab_eff[i][j] * estimator_matrix[i][j]
-    e_h /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
-    dE_dR /= (2.0 * PLANCK_REDUCED_KCAL_MOL_FS)
-
-    for k in range(3):
-        f_b = -dE_dR * context.uab[k]
-        forces[context.idx_b][k] += f_b
-        forces[context.idx_a][k] -= f_b
 
     h_fbts = k_total + context.v_ss + e_h
     terms = {
